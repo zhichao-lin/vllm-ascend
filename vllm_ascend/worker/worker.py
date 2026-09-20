@@ -232,6 +232,37 @@ class NPUWorker(WorkerBase):
                 except Exception:
                     return
 
+    def prepare_kv_transfer_for_sleep(self) -> dict[str, int]:
+        """Force-free Mooncake delayed KV and drop P2P holds before CaMem unmap."""
+        return self._prepare_kv_transfer_for_sleep()
+
+    def _iter_kv_connectors(self):
+        if not has_kv_transfer_group():
+            return
+        connector = get_kv_transfer_group()
+        connectors = getattr(connector, "_connectors", None)
+        targets = list(connectors) if connectors else [connector]
+        yield from targets
+
+    def _prepare_kv_transfer_for_sleep(self) -> dict[str, int]:
+        remaining = 0
+        for child in self._iter_kv_connectors():
+            prepare = getattr(child, "prepare_for_sleep", None)
+            if not callable(prepare):
+                continue
+            result = prepare()
+            if isinstance(result, dict):
+                remaining += int(result.get("delayed_free_remaining", 0) or 0)
+            elif isinstance(result, int):
+                remaining += result
+        return {"delayed_free_remaining": remaining}
+
+    def _resume_kv_transfer_after_wake(self) -> None:
+        for child in self._iter_kv_connectors():
+            resume = getattr(child, "prepare_for_wake", None)
+            if callable(resume):
+                resume()
+
     def sleep(self, level: int = 1) -> None:
         free_bytes_before_sleep = torch.npu.mem_get_info()[0]
         model = self.model_runner.model
@@ -249,8 +280,25 @@ class NPUWorker(WorkerBase):
         if cleanup_enabled:
             self.sleep_wakeup_manager.sleep()
 
+        try:
+            self._prepare_kv_transfer_for_sleep()
+        except Exception:
+            self._resume_kv_transfer_after_wake()
+            raise
         allocator = CaMemAllocator.get_instance()
+        logger.info(
+            "[kv_sleep] before unregister is_register_buffer=%s n_buffers=%s",
+            global_te.is_register_buffer,
+            len(global_te.registered_buffers),
+        )
         global_te.unregister_buffer()
+        logger.info(
+            "[kv_sleep] after unregister is_register_buffer=%s n_buffers=%s",
+            global_te.is_register_buffer,
+            len(global_te.registered_buffers),
+        )
+        torch.npu.synchronize()
+        logger.info("[kv_sleep] start CaMem sleep")
         allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
         free_bytes_after_sleep, total = torch.npu.mem_get_info()
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
@@ -276,7 +324,19 @@ class NPUWorker(WorkerBase):
         allocator = CaMemAllocator.get_instance()
         allocator.wake_up(tags=tags)
         if tags is None or "kv_cache" in tags:
+            logger.info(
+                "[kv_sleep] before reregister is_register_buffer=%s n_buffers=%s tags=%s",
+                global_te.is_register_buffer,
+                len(global_te.registered_buffers),
+                tags,
+            )
             global_te.reregister_buffer()
+            logger.info(
+                "[kv_sleep] after reregister is_register_buffer=%s n_buffers=%s",
+                global_te.is_register_buffer,
+                len(global_te.registered_buffers),
+            )
+            self._resume_kv_transfer_after_wake()
 
         # Restore the buffers after level 2 sleep
         if len(self._sleep_saved_buffers):

@@ -202,6 +202,25 @@ class KVCacheTaskTracker:
                 break
         return expired_requests
 
+    def force_free_all_delayed_requests(self) -> int:
+        """Immediately finish every delayed-free request instead of waiting for timeout."""
+        with self.done_task_lock:
+            delayed_ids = set(self.delayed_free_requests.keys())
+            self.delayed_free_requests.clear()
+            leftover_ids = set(self.reqs_to_process)
+            self.reqs_to_process.clear()
+            finished_ids = delayed_ids | leftover_ids
+            if finished_ids:
+                self.finished_requests.update(finished_ids)
+                logger.warning(
+                    "Force-freed %s Mooncake P2P requests before sleep "
+                    "(delayed=%s in-flight=%s). Do not wait for abort timeout.",
+                    len(finished_ids),
+                    len(delayed_ids),
+                    len(leftover_ids - delayed_ids),
+                )
+            return 0
+
 
 class KVCacheSendingThread(threading.Thread):
     def __init__(
@@ -421,6 +440,8 @@ class KVCacheRecvingThread(threading.Thread):
         self.peer_request_queues: defaultdict[tuple[str, int], deque[dict[str, Any]]] = defaultdict(deque)
         self.active_peer_request_handlers: set[tuple[str, int]] = set()
         self.peer_request_queues_lock = threading.Lock()
+        self._reject_new_transfers = False
+        self._recv_accept_lock = threading.Lock()
         self.request_task_counts: defaultdict[str, int] = defaultdict(int)
         self.finished_request_markers: set[str] = set()
         self.request_task_counts_lock = threading.Lock()
@@ -463,6 +484,55 @@ class KVCacheRecvingThread(threading.Thread):
         self.proc_not_transfer_request: dict[str, bool] = {}
         self.proc_not_transfer_request_lock = threading.Lock()
 
+    def _has_inflight_transfers(self) -> bool:
+        with self.peer_request_queues_lock:
+            return bool(self.active_peer_request_handlers)
+
+    def _drop_queued_transfers(self) -> int:
+        dropped = 0
+        while True:
+            try:
+                self.request_queue.get_nowait()
+                dropped += 1
+                self.request_queue.task_done()
+            except queue.Empty:
+                break
+        with self.peer_request_queues_lock:
+            for peer_queue in self.peer_request_queues.values():
+                dropped += len(peer_queue)
+                peer_queue.clear()
+        return dropped
+
+    def wait_idle(self, timeout_s: float = 30.0) -> bool:
+        """Drop queued recv work, then wait for in-flight TransferSync to finish.
+
+        Does not join or shut down the daemon thread. Raises on timeout.
+        """
+        with self._recv_accept_lock:
+            self._reject_new_transfers = True
+            dropped = self._drop_queued_transfers()
+        if dropped:
+            logger.warning("[kv_sleep] dropped %s queued recv transfers; waiting in-flight RDMA", dropped)
+        deadline = time.monotonic() + timeout_s
+        while True:
+            if not self._has_inflight_transfers():
+                logger.info("[kv_sleep] recv wait_idle ok")
+                return True
+            if time.monotonic() >= deadline:
+                with self.peer_request_queues_lock:
+                    n_handlers = len(self.active_peer_request_handlers)
+                self.resume_after_wake()
+                raise RuntimeError(
+                    f"recv wait_idle timed out after {timeout_s:.3f}s "
+                    f"active_handlers={n_handlers}"
+                )
+            time.sleep(0.01)
+
+    def resume_after_wake(self) -> None:
+        with self._recv_accept_lock:
+            self._reject_new_transfers = False
+        logger.info("[kv_sleep] recv accepting transfers again")
+
     def add_request(
         self,
         request_id: str,
@@ -481,21 +551,25 @@ class KVCacheRecvingThread(threading.Thread):
         if remote_port_send_num is None:
             remote_port_send_num = {}
         logger.debug("Adding request %s to the queue.", request_id)
-        self.request_queue.put(
-            {
-                "request_id": request_id,
-                "local_block_ids": local_block_ids,
-                "remote_block_ids": remote_block_ids,
-                "remote_engine_id": remote_engine_id,
-                "remote_request_id": remote_request_id,
-                "remote_host": remote_host,
-                "remote_handshake_port": remote_handshake_port,
-                "offset": offset,
-                "tp_num_need_pulls": tp_num_need_pulls,
-                "remote_port_send_num": remote_port_send_num,
-                "all_task_done": all_task_done,
-            }
-        )
+        with self._recv_accept_lock:
+            if self._reject_new_transfers:
+                logger.warning("[kv_sleep] rejecting recv request %s after drain started", request_id)
+                return
+            self.request_queue.put(
+                {
+                    "request_id": request_id,
+                    "local_block_ids": local_block_ids,
+                    "remote_block_ids": remote_block_ids,
+                    "remote_engine_id": remote_engine_id,
+                    "remote_request_id": remote_request_id,
+                    "remote_host": remote_host,
+                    "remote_handshake_port": remote_handshake_port,
+                    "offset": offset,
+                    "tp_num_need_pulls": tp_num_need_pulls,
+                    "remote_port_send_num": remote_port_send_num,
+                    "all_task_done": all_task_done,
+                }
+            )
 
     def get_and_clear_finished_requests(self) -> set[str]:
         """
@@ -515,7 +589,15 @@ class KVCacheRecvingThread(threading.Thread):
                     logger.warning("Received a None request. ")
                     self.request_queue.task_done()
                     continue
-                self._submit_request(request_data)
+                with self._recv_accept_lock:
+                    if self._reject_new_transfers:
+                        self.request_queue.task_done()
+                        logger.warning(
+                            "[kv_sleep] dropping dequeued recv request %s after drain started",
+                            request_data.get("request_id"),
+                        )
+                        continue
+                    self._submit_request(request_data)
             except Exception as e:
                 logger.error("Error in KVCacheTransferThread. error=%s. ", e)
 
@@ -1123,6 +1205,10 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished_all_groups(request, block_ids)
 
+    def on_new_request(self, request: "Request") -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.on_new_request(request)
+
     ############################################################
     # Worker Side Methods
     ############################################################
@@ -1153,6 +1239,22 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     def wait_for_save(self):
         """MooncakeConnector does not save explicitly."""
         pass
+
+    def prepare_for_sleep(self) -> dict[str, int]:
+        remaining = 0
+        if self.connector_scheduler is not None:
+            remaining = self.connector_scheduler.force_free_delayed_requests()
+        if self.connector_worker is not None:
+            remaining = self.connector_worker.prepare_for_sleep()
+        return {"delayed_free_remaining": remaining}
+
+    def prepare_for_wake(self) -> None:
+        if self.connector_worker is not None:
+            self.connector_worker.prepare_for_wake()
+
+    def reset_cache(self) -> bool | None:
+        self.prepare_for_sleep()
+        return True
 
     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
         """
@@ -1260,6 +1362,13 @@ class MooncakeConnectorScheduler:
             cdiv(n_tokens, block_size) + 1 if n_tokens else 0 for n_tokens, block_size in sw_sizes_tokens
         ]
 
+    def force_free_delayed_requests(self) -> int:
+        n = len(self._reqs_need_send)
+        if n:
+            logger.warning("Force-clearing %s scheduler-side delayed P2P send requests before sleep", n)
+        self._reqs_need_send.clear()
+        return 0
+
     def get_sw_clipped_blocks(self, block_ids: BlockIds) -> BlockIds:
         """
         Clip the number of blocks to the sliding window size for each kv cache group
@@ -1312,14 +1421,39 @@ class MooncakeConnectorScheduler:
             request.num_prompt_tokens -= 1
             request.max_tokens = 1
             params["_p_side_truncated"] = True
+            if getattr(request, "_block_hasher", None) is not None:
+                request.block_hashes.clear()
+                request.update_block_hashes()
 
-    def _compute_transfer_block_ids(self, block_ids: BlockIds, prompt_len: int) -> BlockIds:
+    def on_new_request(self, request: "Request") -> None:
+        params = request.kv_transfer_params
+        if params is not None and params.get("do_remote_decode") and self.need_truncate:
+            self._truncate_request_for_prefill(request)
+
+    def _is_state_group(self, group_idx: int) -> bool:
+        specs = getattr(self, "kv_cache_specs", None)
+        if not specs or group_idx >= len(specs):
+            return False
+        group_specs = specs[group_idx]
+        if not isinstance(group_specs, (list, tuple)):
+            return isinstance(group_specs, MambaSpec)
+        return any(isinstance(spec, MambaSpec) for spec in group_specs)
+
+    def _compute_transfer_block_ids(
+        self,
+        block_ids: BlockIds,
+        prompt_len: int,
+        drop_dummy_state_block: bool = False,
+    ) -> BlockIds:
         transfer_block_ids = []
         for i, blocks in enumerate(block_ids):
+            group_blocks = list(blocks)
+            if drop_dummy_state_block and self._is_state_group(i) and len(group_blocks) > 1:
+                group_blocks = group_blocks[:-1]
             group_token_len = prompt_len
             group_block_len = math.ceil(group_token_len / self.group_block_size[i])
             if group_block_len > 0:
-                transfer_block_ids.append(blocks[:group_block_len])
+                transfer_block_ids.append(group_blocks[:group_block_len])
             else:
                 transfer_block_ids.append([])
         return tuple(transfer_block_ids)
@@ -1351,12 +1485,11 @@ class MooncakeConnectorScheduler:
             # Remote prefill: get all prompt blocks from remote.
             token_ids = request.prompt_token_ids or []
             actual = self._state_prefill_token_count(len(token_ids))
+            if self.need_truncate and len(token_ids) > 1:
+                params["_recompute_last_prompt_token"] = True
             count = actual - num_computed_tokens
             if count > 0:
                 return count, True
-
-        if params is not None and params.get("do_remote_decode") and self.need_truncate:
-            self._truncate_request_for_prefill(request)
 
         # No remote prefill for this request.
         return 0, False
@@ -1372,6 +1505,11 @@ class MooncakeConnectorScheduler:
         if params is not None and (params.get("do_remote_prefill", False) or params.get("do_remote_decode", False)):
             self._reqs_in_batch.add(request.request_id)
         if params is not None and params.get("do_remote_prefill"):
+            if self.need_truncate:
+                num_prompt_tokens = request.num_prompt_tokens or len(request.prompt_token_ids or [])
+                if num_prompt_tokens > 1:
+                    num_external_tokens = min(num_external_tokens, num_prompt_tokens - 1)
+                    params["_recompute_last_prompt_token"] = True
             if params.get("remote_block_ids"):
                 if all(p in params for p in ("remote_engine_id", "remote_host", "remote_port", "remote_request_id")):
                     local_block_ids = blocks.get_unhashed_block_ids_all_groups() if num_external_tokens > 0 else []
@@ -1436,7 +1574,11 @@ class MooncakeConnectorScheduler:
 
         # P-side truncation can leave block ids allocated for the original
         # prompt length. Drop those unwritten blocks before SWA tail clipping.
-        computed_block_ids = self._compute_transfer_block_ids(block_ids, request.num_prompt_tokens)
+        computed_block_ids = self._compute_transfer_block_ids(
+            block_ids,
+            request.num_prompt_tokens,
+            drop_dummy_state_block=bool(params.get("_p_side_truncated")),
+        )
         computed_block_ids = self.get_sw_clipped_blocks(computed_block_ids)
         computed_block_lens = [len(block_id_list) for block_id_list in computed_block_ids]
         delay_free_blocks = sum(computed_block_lens) > 0
@@ -1575,6 +1717,18 @@ class MooncakeConnectorWorker:
             self.tp_num_need_pulls = num_d_block_heads // num_p_block_heads
         self.local_remote_block_port_mapping: dict[str, list[list[int]] | None] = {}
         self.remote_port_send_num: dict[str, dict[int, RemotePortInfo]] = {}
+
+    def prepare_for_sleep(self) -> int:
+        remaining = 0
+        if self.kv_send_thread is not None:
+            remaining = self.kv_send_thread.task_tracker.force_free_all_delayed_requests()
+        if self.kv_recv_thread is not None:
+            self.kv_recv_thread.wait_idle()
+        return remaining
+
+    def prepare_for_wake(self) -> None:
+        if self.kv_recv_thread is not None:
+            self.kv_recv_thread.resume_after_wake()
 
     def _get_prefill_decode_size(self, vllm_config: VllmConfig):
         # get prefill tp and dp size from extra config

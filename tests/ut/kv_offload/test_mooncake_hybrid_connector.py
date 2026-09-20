@@ -1,3 +1,4 @@
+import queue
 import sys
 import threading
 import time
@@ -19,7 +20,9 @@ from vllm.v1.request import RequestStatus  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_hybrid_connector import (  # noqa: E402
     MAX_REQUESTS_PER_PEER_HANDLER,
     KVCacheRecvingThread,
+    MooncakeConnector,
     MooncakeConnectorScheduler,
+    MooncakeConnectorWorker,
 )
 
 
@@ -317,3 +320,78 @@ class TestMooncakeHybridConnectorScheduler(unittest.TestCase):
         self.assertIsNotNone(params)
         self.assertEqual(params["remote_block_ids"], ([0], [100, 101]))
         self.assertEqual(params["num_prompt_blocks"], 2)
+
+    def test_get_num_new_matched_tokens_hybrid_decode_loads_n_minus_1(self):
+        scheduler = self._make_scheduler()
+        scheduler.need_truncate = True
+        request = MockRequest(
+            "req-d",
+            prompt_token_ids=list(range(4)),
+            kv_transfer_params={"do_remote_prefill": True},
+            status=RequestStatus.WAITING,
+        )
+
+        tokens, async_flag = scheduler.get_num_new_matched_tokens(request, 0)
+
+        self.assertEqual(tokens, 3)
+        self.assertTrue(async_flag)
+        self.assertTrue(request.kv_transfer_params["_recompute_last_prompt_token"])
+
+
+class TestHybridKVCacheRecvingThreadWake(unittest.TestCase):
+    def setUp(self):
+        self.thread = object.__new__(KVCacheRecvingThread)
+        self.thread._recv_accept_lock = threading.Lock()
+        self.thread._reject_new_transfers = False
+        self.thread.request_queue = queue.Queue()
+        self.thread.peer_request_queues = defaultdict(deque)
+        self.thread.active_peer_request_handlers = set()
+        self.thread.peer_request_queues_lock = threading.Lock()
+
+    def _enqueue_recv_request(self, request_id: str) -> None:
+        self.thread.add_request(
+            request_id=request_id,
+            remote_request_id=f"{request_id}-remote",
+            local_block_ids=[[1]],
+            remote_block_ids=[[2]],
+            remote_engine_id="remote_engine",
+            remote_host="localhost",
+            remote_handshake_port=6666,
+            offset=0,
+            tp_num_need_pulls=1,
+        )
+
+    def test_resume_after_wake_accepts_new_requests(self):
+        self.assertTrue(self.thread.wait_idle(timeout_s=0.2))
+        self.thread.resume_after_wake()
+        self._enqueue_recv_request("after-wake")
+        queued = self.thread.request_queue.get_nowait()
+        self.assertEqual(queued["request_id"], "after-wake")
+
+    def test_wait_idle_timeout_does_not_permanently_reject_requests(self):
+        self.thread.active_peer_request_handlers.add(("localhost", 6666))
+        with self.assertRaisesRegex(RuntimeError, "recv wait_idle timed out"):
+            self.thread.wait_idle(timeout_s=0.05)
+        self._enqueue_recv_request("after-timeout")
+        queued = self.thread.request_queue.get_nowait()
+        self.assertEqual(queued["request_id"], "after-timeout")
+
+
+class TestHybridConnectorWake(unittest.TestCase):
+    def test_prepare_for_wake_forwards_to_worker(self):
+        connector = MooncakeConnector.__new__(MooncakeConnector)
+        connector.connector_worker = MagicMock()
+
+        connector.prepare_for_wake()
+
+        connector.connector_worker.prepare_for_wake.assert_called_once_with()
+
+    def test_prepare_for_wake_resumes_recv_thread(self):
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        recv = MagicMock()
+        worker.kv_send_thread = None
+        worker.kv_recv_thread = recv
+
+        worker.prepare_for_wake()
+
+        recv.resume_after_wake.assert_called_once_with()

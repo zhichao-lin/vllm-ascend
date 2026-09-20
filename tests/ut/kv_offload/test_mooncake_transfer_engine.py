@@ -23,6 +23,33 @@ def test_unregister_and_reregister_registered_buffers():
     assert global_te.transfer_engine.register_memory.call_count == 4
 
 
+def test_unregister_when_flag_false_but_buffers_exist():
+    global_te = GlobalTE()
+    global_te.transfer_engine = MagicMock()
+    global_te.transfer_engine.unregister_memory.return_value = 0
+    global_te.registered_buffers = [(0x1000, 128), (0x2000, 256)]
+    global_te.is_register_buffer = False
+
+    global_te.unregister_buffer()
+
+    assert global_te.transfer_engine.unregister_memory.call_count == 2
+    global_te.transfer_engine.unregister_memory.assert_any_call(0x1000)
+    global_te.transfer_engine.unregister_memory.assert_any_call(0x2000)
+    assert not global_te.is_register_buffer
+    assert global_te.registered_buffers == [(0x1000, 128), (0x2000, 256)]
+
+
+def test_unregister_skips_when_buffers_empty():
+    global_te = GlobalTE()
+    global_te.transfer_engine = MagicMock()
+    global_te.is_register_buffer = True
+    global_te.registered_buffers = []
+
+    global_te.unregister_buffer()
+
+    global_te.transfer_engine.unregister_memory.assert_not_called()
+
+
 def test_unregister_failure_rolls_back_completed_buffers():
     global_te = GlobalTE()
     global_te.transfer_engine = MagicMock()

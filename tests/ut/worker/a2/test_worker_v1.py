@@ -355,10 +355,11 @@ class TestNPUWorker(TestBase):
             self.assertEqual(worker.cache_config.num_gpu_blocks, 100)
             self.assertEqual(worker.cache_config.num_cpu_blocks, 50)
 
+    @patch("vllm_ascend.worker.worker.torch.npu.synchronize")
     @patch("torch.npu.mem_get_info", side_effect=[(100, 200), (150, 200)])
     @patch("vllm_ascend.worker.worker.CaMemAllocator")
     @patch("vllm_ascend.worker.worker.get_ascend_config")
-    def test_sleep_uses_rl_extra_cleanup(self, mock_get_config, mock_allocator_class, mock_mem_get_info):
+    def test_sleep_uses_rl_extra_cleanup(self, mock_get_config, mock_allocator_class, mock_mem_get_info, _mock_sync):
         from vllm_ascend.worker.worker import NPUWorker
 
         mock_get_config.return_value = SimpleNamespace(
@@ -375,6 +376,91 @@ class TestNPUWorker(TestBase):
         worker.sleep_wakeup_manager.sleep.assert_called_once_with()
         mock_allocator_class.get_instance.return_value.sleep.assert_called_once_with(offload_tags=("weights",))
         self.assertEqual(mock_mem_get_info.call_count, 2)
+
+    @patch("vllm_ascend.worker.worker.torch.npu.synchronize")
+    @patch("vllm_ascend.worker.worker.global_te")
+    @patch("vllm_ascend.worker.worker.get_kv_transfer_group")
+    @patch("vllm_ascend.worker.worker.has_kv_transfer_group", return_value=True)
+    @patch("torch.npu.mem_get_info", side_effect=[(100, 200), (150, 200)])
+    @patch("vllm_ascend.worker.worker.CaMemAllocator")
+    @patch("vllm_ascend.worker.worker.get_ascend_config")
+    def test_sleep_prepares_kv_transfer_before_unmap(
+        self,
+        mock_get_config,
+        mock_allocator_class,
+        mock_mem_get_info,
+        _mock_has_kv,
+        mock_get_kv,
+        mock_global_te,
+        mock_synchronize,
+    ):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        mock_get_config.return_value = SimpleNamespace(
+            rl_config=SimpleNamespace(enabled=False, sleep_mode_extra_cleanup=False)
+        )
+        connector = MagicMock()
+        inner = MagicMock()
+        connector._connectors = [inner]
+        mock_get_kv.return_value = connector
+        order: list[str] = []
+        inner.prepare_for_sleep.side_effect = lambda: order.append("prepare")
+        mock_global_te.unregister_buffer.side_effect = lambda: order.append("unregister")
+        mock_synchronize.side_effect = lambda: order.append("sync")
+        mock_allocator_class.get_instance.return_value.sleep.side_effect = lambda **kwargs: order.append("unmap")
+
+        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+            worker = NPUWorker()
+        worker.model_runner = MagicMock()
+        worker.model_runner.model.named_buffers.return_value = []
+        worker.sleep_wakeup_manager = MagicMock()
+
+        worker.sleep()
+
+        self.assertEqual(order, ["prepare", "unregister", "sync", "unmap"])
+        inner.prepare_for_sleep.assert_called_once_with()
+        worker.sleep_wakeup_manager.sleep.assert_not_called()
+
+    @patch("vllm_ascend.worker.worker.torch.npu.synchronize")
+    @patch("vllm_ascend.worker.worker.global_te")
+    @patch("vllm_ascend.worker.worker.get_kv_transfer_group")
+    @patch("vllm_ascend.worker.worker.has_kv_transfer_group", return_value=True)
+    @patch("torch.npu.mem_get_info", side_effect=[(100, 200), (150, 200)])
+    @patch("vllm_ascend.worker.worker.CaMemAllocator")
+    @patch("vllm_ascend.worker.worker.get_ascend_config")
+    def test_sleep_does_not_unmap_when_prepare_raises(
+        self,
+        mock_get_config,
+        mock_allocator_class,
+        mock_mem_get_info,
+        _mock_has_kv,
+        mock_get_kv,
+        mock_global_te,
+        mock_synchronize,
+    ):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        mock_get_config.return_value = SimpleNamespace(
+            rl_config=SimpleNamespace(enabled=False, sleep_mode_extra_cleanup=False)
+        )
+        connector = MagicMock()
+        inner = MagicMock()
+        connector._connectors = [inner]
+        mock_get_kv.return_value = connector
+        inner.prepare_for_sleep.side_effect = RuntimeError("recv wait_idle timed out after 0.05s")
+
+        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+            worker = NPUWorker()
+        worker.model_runner = MagicMock()
+        worker.model_runner.model.named_buffers.return_value = []
+        worker.sleep_wakeup_manager = MagicMock()
+
+        with self.assertRaisesRegex(RuntimeError, "recv wait_idle timed out"):
+            worker.sleep()
+
+        mock_global_te.unregister_buffer.assert_not_called()
+        mock_allocator_class.get_instance.return_value.sleep.assert_not_called()
+        inner.prepare_for_wake.assert_called_once_with()
 
     @patch("vllm_ascend.worker.worker.CaMemAllocator")
     @patch("vllm_ascend.worker.worker.get_ascend_config")
@@ -418,6 +504,45 @@ class TestNPUWorker(TestBase):
 
             worker.wake_up(tags=["kv_cache"])
             mock_model_runner.post_kv_cache_wake_up.assert_called_once_with()
+
+    @patch("vllm_ascend.worker.worker.global_te")
+    @patch("vllm_ascend.worker.worker.get_kv_transfer_group")
+    @patch("vllm_ascend.worker.worker.has_kv_transfer_group", return_value=True)
+    @patch("vllm_ascend.worker.worker.CaMemAllocator")
+    @patch("vllm_ascend.worker.worker.get_ascend_config")
+    def test_wake_up_resumes_kv_transfer_after_reregister(
+        self,
+        mock_get_config,
+        mock_allocator_class,
+        _mock_has_kv,
+        mock_get_kv,
+        mock_global_te,
+    ):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        mock_get_config.return_value = SimpleNamespace(
+            weight_nz_mode=0,
+            rl_config=SimpleNamespace(enabled=False, sleep_mode_extra_cleanup=False),
+        )
+        connector = MagicMock()
+        inner = MagicMock()
+        connector._connectors = [inner]
+        mock_get_kv.return_value = connector
+        order: list[str] = []
+        mock_global_te.reregister_buffer.side_effect = lambda: order.append("reregister")
+        inner.prepare_for_wake.side_effect = lambda: order.append("resume")
+
+        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+            worker = NPUWorker()
+        worker.model_runner = MagicMock()
+        worker._sleep_saved_buffers = {}
+        worker.sleep_wakeup_manager = MagicMock()
+
+        worker.wake_up(tags=["kv_cache"])
+
+        self.assertEqual(order, ["reregister", "resume"])
+        inner.prepare_for_wake.assert_called_once_with()
+        worker.model_runner.post_kv_cache_wake_up.assert_called_once_with()
 
     @staticmethod
     def _make_unquantized_moe_model():

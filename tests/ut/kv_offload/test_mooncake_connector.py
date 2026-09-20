@@ -727,6 +727,67 @@ class TestKVCacheRecvingThreadBasic(unittest.TestCase):
         self.assertEqual(queued["remote_host"], "localhost")
         self.assertEqual(queued["num_computed_tokens"], 0)
 
+    def test_wait_idle_when_queues_empty(self):
+        self.assertTrue(self.thread.wait_idle(timeout_s=0.2))
+
+    def test_wait_idle_drops_queued_requests_instead_of_waiting(self):
+        self.thread.request_queue.put({"request_id": "queued"})
+        peer_key = ("localhost", 6666)
+        with self.thread.peer_request_queues_lock:
+            self.thread.peer_request_queues[peer_key].append({"request_id": "peer-queued"})
+        self.assertTrue(self.thread.wait_idle(timeout_s=0.2))
+        self.assertTrue(self.thread.request_queue.empty())
+        with self.thread.peer_request_queues_lock:
+            self.assertFalse(any(self.thread.peer_request_queues.values()))
+
+    def test_wait_idle_times_out_when_peer_handler_active(self):
+        self.thread.active_peer_request_handlers.add(("localhost", 6666))
+        with self.assertRaisesRegex(RuntimeError, "recv wait_idle timed out"):
+            self.thread.wait_idle(timeout_s=0.05)
+
+    def test_wait_idle_returns_when_inflight_handler_finishes(self):
+        self.thread.active_peer_request_handlers.add(("localhost", 6666))
+
+        def clear_handler():
+            time.sleep(0.05)
+            with self.thread.peer_request_queues_lock:
+                self.thread.active_peer_request_handlers.clear()
+
+        threading.Thread(target=clear_handler, daemon=True).start()
+        self.assertTrue(self.thread.wait_idle(timeout_s=1.0))
+
+    def _enqueue_recv_request(self, request_id: str) -> None:
+        self.thread.add_request(
+            request_id=request_id,
+            remote_request_id=f"{request_id}-remote",
+            local_block_ids=[[1]],
+            remote_block_ids=[[2]],
+            group_pulls=[],
+            remote_engine_id="remote_engine",
+            remote_host="localhost",
+            remote_handshake_port=6666,
+        )
+
+    def test_wait_idle_rejects_new_requests_after_drain(self):
+        self.assertTrue(self.thread.wait_idle(timeout_s=0.2))
+        self._enqueue_recv_request("late")
+        self.assertTrue(self.thread.request_queue.empty())
+
+    def test_resume_after_wake_accepts_new_requests(self):
+        self.assertTrue(self.thread.wait_idle(timeout_s=0.2))
+        self.thread.resume_after_wake()
+        self._enqueue_recv_request("after-wake")
+        queued = self.thread.request_queue.get_nowait()
+        self.assertEqual(queued["request_id"], "after-wake")
+
+    def test_wait_idle_timeout_does_not_permanently_reject_requests(self):
+        self.thread.active_peer_request_handlers.add(("localhost", 6666))
+        with self.assertRaisesRegex(RuntimeError, "recv wait_idle timed out"):
+            self.thread.wait_idle(timeout_s=0.05)
+        self._enqueue_recv_request("after-timeout")
+        queued = self.thread.request_queue.get_nowait()
+        self.assertEqual(queued["request_id"], "after-timeout")
+
     def test_mark_and_is_failed(self):
         self.thread._mark_failed_recv_request("req1", [[10, 20]])
         self.assertTrue(self.thread._is_failed_recv_request("req1"))
@@ -1374,9 +1435,15 @@ class MockRequest:
     def __init__(self, request_id, prompt_token_ids=None, kv_transfer_params=None, status=None):
         self.request_id = request_id
         self.prompt_token_ids = prompt_token_ids or [1, 2, 3, 4]
+        self.prompt_embeds = None
         self.kv_transfer_params = kv_transfer_params or {}
         self.status = status or "running"
         self.output_token_ids = [101, 102]
+        self.num_prompt_tokens = len(self.prompt_token_ids)
+        self.max_tokens = 16
+        self._all_token_ids = list(self.prompt_token_ids)
+        self.block_hashes = ["hash0"]
+        self._block_hasher = None
 
 
 class MockKVCacheGroup:
@@ -1443,6 +1510,19 @@ class TestKVCacheTaskTracker(unittest.TestCase):
         result_delay = self.tracker.delayed_free_requests
         self.assertEqual(len(result_delay), 1)
         self.assertIn("req_2", result_delay)
+
+    def test_force_free_all_delayed_requests_does_not_wait_for_timeout(self):
+        current_time = time.time()
+        self.tracker.add_req_to_process("req_1")
+        self.tracker.add_req_to_process("req_2")
+        self.tracker.add_delayed_request("req_1", current_time)
+        self.tracker.add_delayed_request("req_2", current_time)
+        remaining = self.tracker.force_free_all_delayed_requests()
+        self.assertEqual(remaining, 0)
+        self.assertEqual(len(self.tracker.delayed_free_requests), 0)
+        self.assertEqual(len(self.tracker.reqs_to_process), 0)
+        finished = self.tracker.get_and_clear_finished_requests()
+        self.assertEqual(finished, {"req_1", "req_2"})
 
     def test_duplicate_task_update(self):
         self.tracker.add_req_to_process("req1")
@@ -1629,6 +1709,26 @@ class TestMooncakeConnectorForScheduler(unittest.TestCase):
         connector.get_num_new_matched_tokens(request, 0)
         mock_method.assert_called_once_with(request, 0)
 
+    def test_on_new_request_forwards_to_scheduler(self):
+        config = MockVllmConfig()
+        with (
+            patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.init_ascend_config"),
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.get_ascend_config",
+                return_value=MagicMock(),
+            ),
+        ):
+            connector = MooncakeConnector(config, KVConnectorRole.SCHEDULER, MockKVCacheConfig())
+        request = MockRequest(
+            "req1",
+            prompt_token_ids=list(range(4)),
+            kv_transfer_params={"do_remote_decode": True},
+        )
+        connector.connector_scheduler.need_truncate = True
+        connector.on_new_request(request)
+        self.assertEqual(request.prompt_token_ids, [0, 1, 2])
+        self.assertTrue(request.kv_transfer_params["_p_side_truncated"])
+
 
 class MockKVCacheBlocks:
     def get_unhashed_block_ids(self):
@@ -1723,6 +1823,14 @@ class TestMooncakeConnector(unittest.TestCase):
         connector.request_finished(request, [1, 2, 3])
         mock_method.assert_called_once_with(request, ([1, 2, 3],))
 
+    def test_prepare_for_wake_forwards_to_worker(self):
+        connector = MooncakeConnector.__new__(MooncakeConnector)
+        connector.connector_worker = MagicMock()
+
+        connector.prepare_for_wake()
+
+        connector.connector_worker.prepare_for_wake.assert_called_once_with()
+
 
 class TestMooncakeConnectorScheduler(unittest.TestCase):
     def setUp(self):
@@ -1756,6 +1864,55 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         self.assertEqual(tokens, 4)
         self.assertTrue(async_flag)
 
+    def test_get_num_new_matched_tokens_hybrid_decode_loads_n_minus_1(self):
+        self.scheduler.need_truncate = True
+        request = MockRequest(
+            "req1",
+            prompt_token_ids=list(range(4)),
+            kv_transfer_params={"do_remote_prefill": True},
+        )
+
+        tokens, async_flag = self.scheduler.get_num_new_matched_tokens(request, 0)
+
+        self.assertEqual(tokens, 3)
+        self.assertTrue(async_flag)
+        self.assertTrue(request.kv_transfer_params["_recompute_last_prompt_token"])
+        self.assertEqual(request.prompt_token_ids, [0, 1, 2, 3])
+
+    def test_on_new_request_truncates_hybrid_prefill_before_cache_lookup(self):
+        self.scheduler.need_truncate = True
+        request = MockRequest(
+            "req1",
+            prompt_token_ids=list(range(4)),
+            kv_transfer_params={"do_remote_decode": True},
+        )
+
+        self.scheduler.on_new_request(request)
+
+        self.assertEqual(request.prompt_token_ids, [0, 1, 2])
+        self.assertEqual(request._all_token_ids, [0, 1, 2])
+        self.assertEqual(request.num_prompt_tokens, 3)
+        self.assertEqual(request.max_tokens, 1)
+        self.assertTrue(request.kv_transfer_params["_p_side_truncated"])
+
+        self.scheduler.on_new_request(request)
+        self.assertEqual(request.prompt_token_ids, [0, 1, 2])
+
+    def test_get_num_new_matched_tokens_does_not_truncate_prefill(self):
+        self.scheduler.need_truncate = True
+        request = MockRequest(
+            "req1",
+            prompt_token_ids=list(range(4)),
+            kv_transfer_params={"do_remote_decode": True},
+        )
+
+        tokens, async_flag = self.scheduler.get_num_new_matched_tokens(request, 3)
+
+        self.assertEqual(tokens, 0)
+        self.assertFalse(async_flag)
+        self.assertEqual(request.prompt_token_ids, [0, 1, 2, 3])
+        self.assertNotIn("_p_side_truncated", request.kv_transfer_params)
+
     def test_update_state_after_alloc_no_remote_prefill(self):
         request = MockRequest("req1")
         blocks = MagicMock()
@@ -1780,6 +1937,27 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         self.assertEqual(self.scheduler._reqs_need_recv["req1"][0], request)
         self.assertEqual(self.scheduler._reqs_need_recv["req1"][1], ([4, 5, 6],))
         self.assertEqual(self.scheduler._reqs_need_recv["req1"][2], ([1, 2, 4, 5, 6],))
+
+    def test_update_state_after_alloc_clamps_hybrid_external_tokens(self):
+        self.scheduler.need_truncate = True
+        request = MockRequest(
+            "req1",
+            prompt_token_ids=list(range(4)),
+            kv_transfer_params={
+                "do_remote_prefill": True,
+                "remote_block_ids": [1, 2, 3, 4],
+                "remote_engine_id": "remote",
+                "remote_request_id": "remote_req1",
+                "remote_host": "localhost",
+                "remote_port": 5000,
+            },
+        )
+        blocks = MockKVCacheBlocks()
+
+        self.scheduler.update_state_after_alloc(request, blocks, 4)
+
+        self.assertEqual(self.scheduler._reqs_need_recv["req1"][3], 3)
+        self.assertTrue(request.kv_transfer_params["_recompute_last_prompt_token"])
 
     def test_request_finished_no_remote_decode(self):
         request = MockRequest("req1")
@@ -1839,6 +2017,40 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         block_ids = self.scheduler._get_transfer_block_ids(([20, 21, 22, 23],), prompt_len=16)
 
         self.assertEqual(block_ids, ([20, 21, 22, 23],))
+
+    def test_get_transfer_block_ids_drops_truncated_prefill_dummy_state_block(self):
+        self.scheduler.group_transfer_info = [
+            types.SimpleNamespace(  # type: ignore[list-item]
+                tokens_per_block=16,
+                blocks_per_window=0,
+                is_state_group=True,
+            )
+        ]
+
+        block_ids = self.scheduler._get_transfer_block_ids(
+            ([20, 21, 22, 23],),
+            prompt_len=16,
+            drop_dummy_state_block=True,
+        )
+
+        self.assertEqual(block_ids, ([20, 21, 22],))
+
+    def test_get_transfer_block_ids_keeps_single_truncated_state_block(self):
+        self.scheduler.group_transfer_info = [
+            types.SimpleNamespace(  # type: ignore[list-item]
+                tokens_per_block=16,
+                blocks_per_window=0,
+                is_state_group=True,
+            )
+        ]
+
+        block_ids = self.scheduler._get_transfer_block_ids(
+            ([20],),
+            prompt_len=16,
+            drop_dummy_state_block=True,
+        )
+
+        self.assertEqual(block_ids, ([20],))
 
     def test_get_transfer_block_ids_uses_compressed_prompt_len(self):
         self.scheduler.group_transfer_info = [
@@ -2042,6 +2254,25 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         )
         self.assertEqual(params["num_prompt_blocks"], 4)
         self.assertIn("req_mixed_groups", self.scheduler._reqs_need_send)
+
+    def test_request_finished_drops_truncated_prefill_dummy_state_block(self):
+        self.scheduler.group_transfer_info = [
+            types.SimpleNamespace(
+                tokens_per_block=16,
+                blocks_per_window=0,
+                is_state_group=True,
+            )
+        ]
+        request = self._make_remote_decode_request(prompt_len=48, request_id="req_dummy_state")
+        request.kv_transfer_params["_p_side_truncated"] = True
+        request.output_token_ids = [101]
+
+        delay_free, params = self.scheduler.request_finished(request, ([300, 301, 302, 303],))
+
+        self.assertTrue(delay_free)
+        self.assertIsNotNone(params)
+        assert params is not None
+        self.assertEqual(params["remote_block_ids"], ([300, 301, 302],))
 
 
 class TestUtils(unittest.TestCase):
@@ -2265,6 +2496,43 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
     def tearDown(self):
         for p in self.patches:
             p.stop()  # type: ignore
+
+    def test_prepare_for_sleep_waits_recv_idle(self):
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        send = MagicMock()
+        send.task_tracker.force_free_all_delayed_requests.return_value = 3
+        recv = MagicMock()
+        recv.wait_idle.return_value = True
+        worker.kv_send_thread = send
+        worker.kv_recv_thread = recv
+
+        remaining = worker.prepare_for_sleep()
+
+        self.assertEqual(remaining, 3)
+        send.task_tracker.force_free_all_delayed_requests.assert_called_once_with()
+        recv.wait_idle.assert_called_once()
+
+    def test_prepare_for_sleep_raises_when_wait_idle_times_out(self):
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        send = MagicMock()
+        recv = MagicMock()
+        recv.wait_idle.side_effect = RuntimeError("recv wait_idle timed out after 0.05s")
+        worker.kv_send_thread = send
+        worker.kv_recv_thread = recv
+
+        with self.assertRaisesRegex(RuntimeError, "recv wait_idle timed out"):
+            worker.prepare_for_sleep()
+        send.task_tracker.force_free_all_delayed_requests.assert_called_once_with()
+
+    def test_prepare_for_wake_resumes_recv_thread(self):
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        recv = MagicMock()
+        worker.kv_send_thread = None
+        worker.kv_recv_thread = recv
+
+        worker.prepare_for_wake()
+
+        recv.resume_after_wake.assert_called_once_with()
 
     def test_register_kv_caches_producer(self):
         worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id, MockKVCacheConfig())

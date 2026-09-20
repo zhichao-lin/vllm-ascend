@@ -1,5 +1,7 @@
 import threading
 
+from vllm.logger import logger
+
 
 class GlobalTE:
     def __init__(self):
@@ -43,13 +45,33 @@ class GlobalTE:
 
     def unregister_buffer(self):
         with self.register_buffer_lock:
-            if not self.is_register_buffer or not self.registered_buffers:
+            n_buffers = len(self.registered_buffers)
+            if not self.registered_buffers:
+                logger.info(
+                    "[kv_sleep] unregister_buffer action=skip skip_reason=buffers_empty "
+                    "is_register_buffer=%s n_buffers=0",
+                    self.is_register_buffer,
+                )
                 return
+            if not self.is_register_buffer:
+                logger.warning(
+                    "[kv_sleep] unregister_buffer action=force_unregister "
+                    "skip_reason=flag_false_buffers_remain is_register_buffer=%s n_buffers=%s",
+                    self.is_register_buffer,
+                    n_buffers,
+                )
+            else:
+                logger.info(
+                    "[kv_sleep] unregister_buffer action=unregister is_register_buffer=%s n_buffers=%s",
+                    self.is_register_buffer,
+                    n_buffers,
+                )
             assert self.transfer_engine is not None, "Transfer engine must be initialized"
 
             unregistered_buffers: list[tuple[int, int]] = []
             for ptr, size in self.registered_buffers:
                 ret_value = self.transfer_engine.unregister_memory(ptr)
+                logger.info("[kv_sleep] unregister_memory ptr=%#x size=%s ret=%s", ptr, size, ret_value)
                 if ret_value != 0:
                     rollback_failures = []
                     for unregistered_ptr, unregistered_size in reversed(unregistered_buffers):
@@ -67,13 +89,28 @@ class GlobalTE:
 
     def reregister_buffer(self):
         with self.register_buffer_lock:
+            n_buffers = len(self.registered_buffers)
             if self.is_register_buffer or not self.registered_buffers:
+                skip_reason = "already_registered" if self.is_register_buffer else "buffers_empty"
+                logger.info(
+                    "[kv_sleep] reregister_buffer action=skip skip_reason=%s "
+                    "is_register_buffer=%s n_buffers=%s",
+                    skip_reason,
+                    self.is_register_buffer,
+                    n_buffers,
+                )
                 return
+            logger.info(
+                "[kv_sleep] reregister_buffer action=reregister is_register_buffer=%s n_buffers=%s",
+                self.is_register_buffer,
+                n_buffers,
+            )
             assert self.transfer_engine is not None, "Transfer engine must be initialized"
 
             reregistered_buffers: list[tuple[int, int]] = []
             for ptr, size in self.registered_buffers:
                 ret_value = self.transfer_engine.register_memory(ptr, size)
+                logger.info("[kv_sleep] register_memory ptr=%#x size=%s ret=%s", ptr, size, ret_value)
                 if ret_value != 0:
                     rollback_failures = []
                     for reregistered_ptr, _ in reversed(reregistered_buffers):

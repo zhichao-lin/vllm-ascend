@@ -259,6 +259,9 @@ class KVCacheSendingLayerThread(threading.Thread):
             else:
                 send_queue_size = 1
         self.send_queue = queue.Queue[SendTask](maxsize=send_queue_size)
+        self._reject_new_sends = False
+        self._send_accept_lock = threading.Lock()
+        self._inflight_sends = 0
         self.failed_reqs: set[str] = set()
         self.k_buffer = k_buffer
         self.v_buffer = v_buffer
@@ -275,7 +278,67 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.ready_event.set()
         while True:
             send_task = self.send_queue.get()
-            self._handle_request(send_task)
+            with self._send_accept_lock:
+                if self._reject_new_sends:
+                    self._finish_dropped_send_task(send_task)
+                    continue
+                self._inflight_sends += 1
+            try:
+                self._handle_request(send_task)
+            finally:
+                with self._send_accept_lock:
+                    self._inflight_sends -= 1
+
+    def enqueue_send_task(self, send_task: SendTask) -> bool:
+        with self._send_accept_lock:
+            if self._reject_new_sends:
+                logger.warning(
+                    "[kv_sleep] rejecting layerwise send layer_idx=%s after drain started",
+                    send_task.layer_idx,
+                )
+                return False
+            self.send_queue.put(send_task)
+            return True
+
+    def _finish_dropped_send_task(self, send_task: SendTask) -> None:
+        if self.reuse_completion_callback is not None:
+            self.reuse_completion_callback(send_task.layer_idx, "dropped_before_sleep")
+        self.send_queue.task_done()
+
+    def _drop_queued_sends(self) -> int:
+        dropped = 0
+        while True:
+            try:
+                send_task = self.send_queue.get_nowait()
+            except queue.Empty:
+                break
+            dropped += 1
+            self._finish_dropped_send_task(send_task)
+        return dropped
+
+    def wait_idle(self, timeout_s: float = 30.0) -> bool:
+        """Drop queued layer sends, then wait for in-flight batch_transfer_sync_write."""
+        with self._send_accept_lock:
+            self._reject_new_sends = True
+            dropped = self._drop_queued_sends()
+        if dropped:
+            logger.warning("[kv_sleep] dropped %s queued layerwise send tasks; waiting in-flight RDMA", dropped)
+        deadline = time.monotonic() + timeout_s
+        while True:
+            with self._send_accept_lock:
+                inflight = self._inflight_sends
+            if inflight == 0:
+                logger.info("[kv_sleep] layerwise send wait_idle ok")
+                return True
+            if time.monotonic() >= deadline:
+                self.resume_after_wake()
+                raise RuntimeError(f"send wait_idle timed out after {timeout_s:.3f}s inflight={inflight}")
+            time.sleep(0.01)
+
+    def resume_after_wake(self) -> None:
+        with self._send_accept_lock:
+            self._reject_new_sends = False
+        logger.info("[kv_sleep] layerwise send accepting transfers again")
 
     def _handle_request(self, send_task: SendTask):
         error: str | None = None
@@ -629,6 +692,11 @@ class KVCacheRecvingLayerThread(threading.Thread):
             self.task_tracker.pop(req_id, None)
             self.failed_requests.add(req_id)
 
+    def wait_idle(self, timeout_s: float = 30.0) -> bool:
+        """Layerwise decode only listens for DONE handshake; RDMA writes happen on Prefill."""
+        logger.info("[kv_sleep] layerwise recv wait_idle skip reason=handshake_only_no_rdma")
+        return True
+
     def update_done_task(self, req_id, trans_count, side_channel_path):
         """
         Handle a completed task by adding it to the done_requests set and removing it from the task tracker.
@@ -793,6 +861,10 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished_all_groups(request, block_ids)
 
+    def on_new_request(self, request: "Request") -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.on_new_request(request)
+
     ############################################################
     # Worker Side Methods
     ############################################################
@@ -845,6 +917,22 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
     def wait_for_save(self):
         """MooncakeLayerwiseConnector does not save explicitly."""
         pass
+
+    def prepare_for_sleep(self) -> dict[str, int]:
+        remaining = 0
+        if self.connector_scheduler is not None:
+            remaining = self.connector_scheduler.force_free_delayed_requests()
+        if self.connector_worker is not None:
+            remaining = self.connector_worker.prepare_for_sleep()
+        return {"delayed_free_remaining": remaining}
+
+    def prepare_for_wake(self) -> None:
+        if self.connector_worker is not None:
+            self.connector_worker.prepare_for_wake()
+
+    def reset_cache(self) -> bool | None:
+        self.prepare_for_sleep()
+        return True
 
 
 class MooncakeLayerwiseConnectorScheduler:
@@ -937,6 +1025,14 @@ class MooncakeLayerwiseConnectorScheduler:
         request.num_prompt_tokens -= 1
         request.max_tokens = 1
         params["_p_side_truncated"] = True
+        if getattr(request, "_block_hasher", None) is not None:
+            request.block_hashes.clear()
+            request.update_block_hashes()
+
+    def on_new_request(self, request: "Request") -> None:
+        params = request.kv_transfer_params
+        if params is not None and params.get("do_remote_decode"):
+            self._truncate_request_for_hybrid_prefill(request)
 
     def _trim_hybrid_remote_block_ids(self, block_ids: tuple[list[int], ...], prompt_len: int) -> tuple[list[int], ...]:
         if not self.need_truncate or prompt_len <= 1:
@@ -976,11 +1072,11 @@ class MooncakeLayerwiseConnectorScheduler:
         if params is not None and params.get("do_remote_prefill"):
             # Remote prefill: get all prompt blocks from remote.
             assert num_computed_tokens % min(self.block_size) == 0
-            count = max(self._hybrid_prefill_token_count(len(request.prompt_token_ids)) - num_computed_tokens, 0)
+            prompt_len = len(request.prompt_token_ids or [])
+            if self.need_truncate and prompt_len > 1:
+                params["_recompute_last_prompt_token"] = True
+            count = max(self._hybrid_prefill_token_count(prompt_len) - num_computed_tokens, 0)
             return count, count > 0
-
-        if params is not None and params.get("do_remote_decode"):
-            self._truncate_request_for_hybrid_prefill(request)
 
         # No remote prefill for this request.
         return 0, False
@@ -994,6 +1090,11 @@ class MooncakeLayerwiseConnectorScheduler:
         )
 
         if params is not None and params.get("do_remote_prefill"):
+            if self.need_truncate:
+                num_prompt_tokens = request.num_prompt_tokens or len(request.prompt_token_ids or [])
+                if num_prompt_tokens > 1:
+                    num_external_tokens = min(num_external_tokens, num_prompt_tokens - 1)
+                    params["_recompute_last_prompt_token"] = True
             do_virtual = params.get("do_virtual", False)
             local_block_ids = (blocks.get_block_ids()) if num_external_tokens > 0 else []
             remote_block_ids = self._trim_hybrid_remote_block_ids(local_block_ids, len(request.prompt_token_ids))
@@ -1182,6 +1283,14 @@ class MooncakeLayerwiseConnectorScheduler:
         """
         # layer_wise push, not need delay_free_blocks
         return False, None
+
+    def force_free_delayed_requests(self) -> int:
+        n = len(self._reqs_need_send_layerwise) + len(self._reqs_need_recv)
+        if n:
+            logger.warning("Force-clearing %s scheduler-side layerwise P2P requests before sleep", n)
+        self._reqs_need_send_layerwise.clear()
+        self._reqs_need_recv.clear()
+        return 0
 
 
 class MooncakeLayerwiseConnectorWorker:
@@ -1534,6 +1643,17 @@ class MooncakeLayerwiseConnectorWorker:
             )
             self.kv_recv_layer_thread.start()
             ready_event.wait()
+
+    def prepare_for_sleep(self) -> int:
+        if self.kv_send_layer_thread is not None:
+            self.kv_send_layer_thread.wait_idle()
+        if self.kv_recv_layer_thread is not None:
+            self.kv_recv_layer_thread.wait_idle()
+        return 0
+
+    def prepare_for_wake(self) -> None:
+        if self.kv_send_layer_thread is not None:
+            self.kv_send_layer_thread.resume_after_wake()
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         done_recving = (
@@ -1998,7 +2118,9 @@ class MooncakeLayerwiseConnectorWorker:
                 # and start H2D before this transfer is registered as pending.
                 self._mark_layer_reuse_pending(self.current_layer)
             try:
-                self.kv_send_layer_thread.send_queue.put(layer_send_task)
+                if not self.kv_send_layer_thread.enqueue_send_task(layer_send_task):
+                    if needs_reuse_gate:
+                        self._complete_layer_reuse(self.current_layer, "dropped_before_sleep")
             except Exception as error:
                 if needs_reuse_gate:
                     self._complete_layer_reuse(self.current_layer, str(error))

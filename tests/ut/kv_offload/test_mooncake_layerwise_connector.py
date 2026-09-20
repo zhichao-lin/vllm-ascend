@@ -1,8 +1,10 @@
 import contextlib
 import importlib.util
 import os
+import queue
 import sys
 import threading
+import time
 import types
 import unittest
 from types import SimpleNamespace
@@ -509,6 +511,50 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
 
         self.thread.callback_func.assert_called_once_with("req", req_meta, 0, trans_flag=False)
 
+    def test_wait_idle_drops_queued_send_tasks(self):
+        self.thread.send_queue.put(SendTask(layer_idx=0, layer_name="layer0"))
+        self.assertTrue(self.thread.wait_idle(timeout_s=0.2))
+        self.assertTrue(self.thread.send_queue.empty())
+
+    def test_wait_idle_times_out_when_send_inflight(self):
+        self.thread._inflight_sends = 1
+        with self.assertRaisesRegex(RuntimeError, "send wait_idle timed out"):
+            self.thread.wait_idle(timeout_s=0.05)
+
+    def test_wait_idle_returns_when_inflight_send_finishes(self):
+        self.thread._inflight_sends = 1
+
+        def clear_inflight():
+            time.sleep(0.05)
+            with self.thread._send_accept_lock:
+                self.thread._inflight_sends = 0
+
+        threading.Thread(target=clear_inflight, daemon=True).start()
+        self.assertTrue(self.thread.wait_idle(timeout_s=1.0))
+
+    def test_wait_idle_rejects_new_sends_after_drain(self):
+        self.assertTrue(self.thread.wait_idle(timeout_s=0.2))
+        accepted = self.thread.enqueue_send_task(SendTask(layer_idx=0, layer_name="layer0"))
+        self.assertFalse(accepted)
+        self.assertTrue(self.thread.send_queue.empty())
+
+    def test_resume_after_wake_accepts_new_sends(self):
+        self.assertTrue(self.thread.wait_idle(timeout_s=0.2))
+        self.thread.resume_after_wake()
+        accepted = self.thread.enqueue_send_task(SendTask(layer_idx=0, layer_name="layer0"))
+        self.assertTrue(accepted)
+        queued = self.thread.send_queue.get_nowait()
+        self.assertEqual(queued.layer_name, "layer0")
+
+    def test_wait_idle_timeout_does_not_permanently_reject_sends(self):
+        self.thread._inflight_sends = 1
+        with self.assertRaisesRegex(RuntimeError, "send wait_idle timed out"):
+            self.thread.wait_idle(timeout_s=0.05)
+        accepted = self.thread.enqueue_send_task(SendTask(layer_idx=1, layer_name="layer1"))
+        self.assertTrue(accepted)
+        queued = self.thread.send_queue.get_nowait()
+        self.assertEqual(queued.layer_name, "layer1")
+
 
 class TestKVCacheRecvingLayerThread(unittest.TestCase):
     def setUp(self):
@@ -536,6 +582,20 @@ class TestKVCacheRecvingLayerThread(unittest.TestCase):
 
         got2 = th.get_and_clear_done_requests()
         self.assertEqual(got2, set())
+
+    def test_wait_idle_does_not_block_on_handshake_tracker(self):
+        th = KVCacheRecvingLayerThread(
+            tp_rank=0,
+            side_channel_port=5555,
+            tp_size=2,
+            pd_head_ratio=1,
+            local_engine_id="engineA",
+            metadata=self.meta,
+            ready_event=self.ready_event,
+        )
+        with th.lock:
+            th.task_tracker["req"] = {"tcp://host:1"}
+        self.assertTrue(th.wait_idle(timeout_s=0.2))
 
     def test_get_and_clear_failed_requests(self):
         th = KVCacheRecvingLayerThread(
@@ -837,8 +897,21 @@ class TestMooncakeLayerwiseConnectorSchedulerMatchedTokens(unittest.TestCase):
 
         self.assertEqual(tokens, 16)
         self.assertTrue(async_flag)
+        self.assertTrue(request.kv_transfer_params["_recompute_last_prompt_token"])
 
-    def test_get_num_new_matched_tokens_hybrid_truncates_prefill_request(self):
+    def test_on_new_request_truncates_hybrid_prefill_before_cache_lookup(self):
+        self.scheduler.need_truncate = True
+        request = MockRequest("req1", prompt_token_ids=list(range(4)), kv_transfer_params={"do_remote_decode": True})
+
+        self.scheduler.on_new_request(request)
+
+        self.assertEqual(request.prompt_token_ids, [0, 1, 2])
+        self.assertEqual(request._all_token_ids, [0, 1, 2])
+        self.assertEqual(request.num_prompt_tokens, 3)
+        self.assertEqual(request.max_tokens, 1)
+        self.assertTrue(request.kv_transfer_params["_p_side_truncated"])
+
+    def test_get_num_new_matched_tokens_does_not_truncate_prefill(self):
         self.scheduler.need_truncate = True
         request = MockRequest("req1", prompt_token_ids=list(range(4)), kv_transfer_params={"do_remote_decode": True})
 
@@ -846,11 +919,8 @@ class TestMooncakeLayerwiseConnectorSchedulerMatchedTokens(unittest.TestCase):
 
         self.assertEqual(tokens, 0)
         self.assertFalse(async_flag)
-        self.assertEqual(request.prompt_token_ids, [0, 1, 2])
-        self.assertEqual(request._all_token_ids, [0, 1, 2])
-        self.assertEqual(request.num_prompt_tokens, 3)
-        self.assertEqual(request.max_tokens, 1)
-        self.assertTrue(request.kv_transfer_params["_p_side_truncated"])
+        self.assertEqual(request.prompt_token_ids, [0, 1, 2, 3])
+        self.assertNotIn("_p_side_truncated", request.kv_transfer_params)
 
     def test_build_connector_meta(self):
         self.scheduler.vllm_config.kv_transfer_config.is_kv_consumer = True
@@ -1216,6 +1286,27 @@ class TestMooncakeLayerwiseConnector(unittest.TestCase):
 
         connector.connector_worker.on_kv_cache_written.assert_called_once_with("layer0")
 
+    def test_prepare_for_sleep_forwards_to_scheduler_and_worker(self):
+        connector = MooncakeLayerwiseConnector.__new__(MooncakeLayerwiseConnector)
+        connector.connector_scheduler = MagicMock()
+        connector.connector_scheduler.force_free_delayed_requests.return_value = 0
+        connector.connector_worker = MagicMock()
+        connector.connector_worker.prepare_for_sleep.return_value = 0
+
+        result = connector.prepare_for_sleep()
+
+        connector.connector_scheduler.force_free_delayed_requests.assert_called_once_with()
+        connector.connector_worker.prepare_for_sleep.assert_called_once_with()
+        self.assertEqual(result, {"delayed_free_remaining": 0})
+
+    def test_prepare_for_wake_forwards_to_worker(self):
+        connector = MooncakeLayerwiseConnector.__new__(MooncakeLayerwiseConnector)
+        connector.connector_worker = MagicMock()
+
+        connector.prepare_for_wake()
+
+        connector.connector_worker.prepare_for_wake.assert_called_once_with()
+
 
 def test_layerwise_reuse_state_tracks_shared_physical_slots():
     worker = MooncakeLayerwiseConnectorWorker.__new__(MooncakeLayerwiseConnectorWorker)
@@ -1295,7 +1386,7 @@ def test_mooncake_save_consumes_early_cache_write_event():
         worker.save_kv_layer("layer0", [MagicMock(), MagicMock()], MagicMock(), connector_metadata)
 
     cache_write_event.record.assert_called_once_with()
-    queued_send_task = worker.kv_send_layer_thread.send_queue.put.call_args.args[0]
+    queued_send_task = worker.kv_send_layer_thread.enqueue_send_task.call_args.args[0]
     assert queued_send_task.wait_event is cache_write_event
     assert worker._cache_write_events == [None]
 
@@ -1311,7 +1402,7 @@ def test_mooncake_save_records_fallback_event_without_early_hook():
         worker.save_kv_layer("layer0", [MagicMock(), MagicMock()], MagicMock(), connector_metadata)
 
     fallback_event.record.assert_called_once_with()
-    queued_send_task = worker.kv_send_layer_thread.send_queue.put.call_args.args[0]
+    queued_send_task = worker.kv_send_layer_thread.enqueue_send_task.call_args.args[0]
     assert queued_send_task.wait_event is fallback_event
 
 
@@ -1596,3 +1687,38 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
         worker.register_kv_caches(kv_caches)
 
         worker.create_kv_buffer.assert_called_once_with(main_cache)
+
+    def test_prepare_for_sleep_waits_send_idle(self):
+        worker = MooncakeLayerwiseConnectorWorker.__new__(MooncakeLayerwiseConnectorWorker)
+        send = MagicMock()
+        recv = MagicMock()
+        worker.kv_send_layer_thread = send
+        worker.kv_recv_layer_thread = recv
+
+        remaining = worker.prepare_for_sleep()
+
+        self.assertEqual(remaining, 0)
+        send.wait_idle.assert_called_once_with()
+        recv.wait_idle.assert_called_once_with()
+
+    def test_prepare_for_sleep_raises_when_send_wait_idle_times_out(self):
+        worker = MooncakeLayerwiseConnectorWorker.__new__(MooncakeLayerwiseConnectorWorker)
+        send = MagicMock()
+        send.wait_idle.side_effect = RuntimeError("send wait_idle timed out after 0.05s")
+        worker.kv_send_layer_thread = send
+        worker.kv_recv_layer_thread = None
+
+        with self.assertRaisesRegex(RuntimeError, "send wait_idle timed out"):
+            worker.prepare_for_sleep()
+
+    def test_prepare_for_wake_resumes_send_thread(self):
+        worker = MooncakeLayerwiseConnectorWorker.__new__(MooncakeLayerwiseConnectorWorker)
+        send = MagicMock()
+        recv = MagicMock()
+        worker.kv_send_layer_thread = send
+        worker.kv_recv_layer_thread = recv
+
+        worker.prepare_for_wake()
+
+        send.resume_after_wake.assert_called_once_with()
+        recv.resume_after_wake.assert_not_called()
