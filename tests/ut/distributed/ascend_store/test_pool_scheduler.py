@@ -27,7 +27,11 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import (
     KVPoolScheduler,
+    LOOKUP_MSG,
     LookupKeyClient,
+    RESET_MSG,
+    RESP_ERR,
+    RESP_OK,
     get_zmq_rpc_path_lookup,
 )
 
@@ -522,6 +526,7 @@ class TestLookupKeyClient(unittest.TestCase):
         self.assertEqual(
             frames,
             [
+                LOOKUP_MSG,
                 (64).to_bytes(4, "big"),
                 b"groups",
                 (16).to_bytes(4, "big"),
@@ -542,6 +547,38 @@ class TestLookupKeyClient(unittest.TestCase):
         client = LookupKeyClient(config)
         client.close()
         mock_socket.close.assert_called_once_with(linger=0)
+
+
+class TestLookupKeyClientReset(unittest.TestCase):
+    def _client(self, recv_bytes):
+        with (
+            patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.make_zmq_socket") as mock_sock,
+            patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.zmq"),
+        ):
+            socket = MagicMock()
+            socket.recv.return_value = recv_bytes
+            mock_sock.return_value = socket
+            config = MagicMock()
+            config.parallel_config.data_parallel_rank = 0
+            config.kv_transfer_config.kv_connector_extra_config = {}
+            client = LookupKeyClient(config)
+            client.socket = socket
+            return client, socket
+
+    def test_reset_ok(self):
+        client, socket = self._client(RESP_OK)
+        self.assertTrue(client.reset())
+        socket.send.assert_called_once_with(RESET_MSG)
+
+    def test_reset_err_or_garbage_is_false(self):
+        for payload in (RESP_ERR, b"", (32).to_bytes(4, "big"), b"nope"):
+            client, _ = self._client(payload)
+            self.assertFalse(client.reset(), msg=repr(payload))
+
+    def test_reset_exception_is_false(self):
+        client, socket = self._client(RESP_OK)
+        socket.send.side_effect = RuntimeError("zmq down")
+        self.assertFalse(client.reset())
 
 
 class TestKVPoolSchedulerStoreQueryKeys(unittest.TestCase):
@@ -848,6 +885,38 @@ class TestKVPoolSchedulerUpdateStateAfterAllocBranches(unittest.TestCase):
         scheduler.load_specs["r1"] = LoadSpec(0, 32, can_load=False)
         scheduler.update_state_after_alloc(MagicMock(request_id="r1"), MagicMock(), 0)
         self.assertTrue(scheduler.load_specs["r1"].can_load)
+
+
+class TestKVPoolSchedulerResetStore(unittest.TestCase):
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_creates_client_when_none(self, mock_client_cls):
+        mock_client_cls.return_value.reset.return_value = True
+        sched = KVPoolScheduler(make_config(), use_layerwise=False)
+        sched.client = None
+        self.assertTrue(sched.reset_store())
+        mock_client_cls.assert_called_once_with(sched.vllm_config)
+        self.assertIs(sched.client, mock_client_cls.return_value)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_false_when_client_reset_false(self, mock_client_cls):
+        mock_client_cls.return_value.reset.return_value = False
+        sched = KVPoolScheduler(make_config(), use_layerwise=False)
+        sched.client = None
+        self.assertFalse(sched.reset_store())
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_false_when_client_reset_raises(self, mock_client_cls):
+        mock_client_cls.return_value.reset.side_effect = RuntimeError("zmq down")
+        sched = KVPoolScheduler(make_config(), use_layerwise=False)
+        sched.client = None
+        self.assertFalse(sched.reset_store())
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_false_when_client_ctor_raises(self, mock_client_cls):
+        mock_client_cls.side_effect = RuntimeError("no socket")
+        sched = KVPoolScheduler(make_config(), use_layerwise=False)
+        sched.client = None
+        self.assertFalse(sched.reset_store())
 
 
 if __name__ == "__main__":

@@ -1718,6 +1718,25 @@ class KVPoolWorker:
         if current_event is not None:
             send_thread.request_queue.join()
 
+    def reset_store(self) -> bool:
+        ok = False
+        try:
+            if self.kv_send_thread is not None:
+                self.kv_send_thread.request_queue.join()
+            if self.kv_recv_thread is not None:
+                self.kv_recv_thread.request_queue.join()
+            if self.m_store is None:
+                ok = True
+            else:
+                ok = self.m_store.reset()
+        except Exception:
+            logger.exception("KVPoolWorker.reset_store failed")
+            ok = False
+        finally:
+            with self._invalid_block_ids_lock:
+                self._invalid_block_ids.clear()
+        return ok
+
     def retrieve_layer(
         self,
         request: ReqMeta,

@@ -30,6 +30,10 @@ from vllm.v1.serial_utils import MsgpackDecoder
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import AscendStoreKVConnectorWorkerMetadata
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import (
+    LOOKUP_MSG,
+    RESET_MSG,
+    RESP_ERR,
+    RESP_OK,
     KVPoolScheduler,
     get_zmq_rpc_path_lookup,
 )
@@ -192,6 +196,16 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             self._kv_cache_events.clear_events()
             self._kv_cache_events = None
 
+    def reset_cache(self) -> bool | None:
+        if getattr(self, "connector_scheduler", None) is None:
+            return None
+        if self.use_layerwise:
+            logger.error("layerwise reset_cache is not implemented")
+            return False
+        self.connector_scheduler.load_specs.clear()
+        self._kv_cache_events = None
+        return self.connector_scheduler.reset_store()
+
     ############################################################
     # Worker Side Methods
     ############################################################
@@ -310,28 +324,38 @@ class LookupKeyServer:
         def process_request():
             while self.running:
                 all_frames = self.socket.recv_multipart(copy=False)
-                token_len = int.from_bytes(all_frames[0], byteorder="big")
-                kv_group_ids = self.decoder.decode([all_frames[1]])
-                hbm_hit_tokens = int.from_bytes(all_frames[2], byteorder="big")
-                hashes_str = self.decoder.decode(all_frames[3:])
-                result = self.pool_worker.lookup_scheduler(
-                    token_len,
-                    hashes_str,
-                    kv_group_ids,
-                    use_layerwise=False,
-                    hbm_hit_tokens=hbm_hit_tokens,
-                )
-                logger.debug(
-                    "KV pool lookup response token_len=%d groups=%s hit_tokens=%d",
-                    token_len,
-                    kv_group_ids,
-                    result,
-                )
-                response = result.to_bytes(4, "big")
-                self.socket.send(response)
+                try:
+                    self.socket.send(self._handle_frames(all_frames))
+                except Exception:
+                    logger.exception("LookupKeyServer REP send failed")
 
         self.thread = threading.Thread(target=process_request, daemon=True)
         self.thread.start()
+
+    def _handle_frames(self, all_frames) -> bytes:
+        try:
+            msg_type = bytes(all_frames[0])
+            if msg_type == RESET_MSG:
+                ok = self.pool_worker.reset_store()
+                return RESP_OK if ok is True else RESP_ERR
+            if msg_type != LOOKUP_MSG:
+                logger.warning("LookupKeyServer unknown msg_type=%r", msg_type)
+                return RESP_ERR
+            token_len = int.from_bytes(all_frames[1], byteorder="big")
+            kv_group_ids = self.decoder.decode([all_frames[2]])
+            hbm_hit_tokens = int.from_bytes(all_frames[3], byteorder="big")
+            hashes_str = self.decoder.decode(all_frames[4:])
+            result = self.pool_worker.lookup_scheduler(
+                token_len,
+                hashes_str,
+                kv_group_ids,
+                use_layerwise=False,
+                hbm_hit_tokens=hbm_hit_tokens,
+            )
+            return result.to_bytes(4, "big")
+        except Exception:
+            logger.exception("LookupKeyServer._handle_frames failed")
+            return RESP_ERR
 
     def close(self):
         self.socket.close(linger=0)

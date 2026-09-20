@@ -270,6 +270,20 @@ class MooncakeBackend(Backend):
             logger.debug("Failed to get key details. keys=%s", keys)
             return None
 
+    def reset(self) -> bool:
+        if self.store is None:
+            return True
+        try:
+            try:
+                ret = self.store.remove_all(force=True)
+            except TypeError:
+                ret = self.store.remove_all()
+            logger.info("MooncakeBackend.reset remove_all returned %r", ret)
+            return True
+        except Exception:
+            logger.exception("MooncakeBackend.reset failed")
+            return False
+
 
 @dataclass
 class MooncakeStoreConfig:

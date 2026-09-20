@@ -18,7 +18,7 @@
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 
@@ -1695,6 +1695,60 @@ class TestKVPoolWorkerTpMismatch(unittest.TestCase):
                     worker._store_kv_tp_mismatch(req)
                     self.assertEqual(len(worker.m_store.put.call_args.args[0]), 1)
                 send_thread.dec_stored_request.assert_called_once_with("r1")
+
+
+class TestKVPoolWorkerResetStore(unittest.TestCase):
+    def _worker(self, send=None, recv=None, reset_ok=True):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
+
+        worker = KVPoolWorker.__new__(KVPoolWorker)
+        worker.kv_send_thread = send
+        worker.kv_recv_thread = recv
+        worker.m_store = MagicMock()
+        worker.m_store.reset.return_value = reset_ok
+        worker._invalid_block_ids = {1, 2}
+        worker._invalid_block_ids_lock = threading.Lock()
+        return worker
+
+    def test_joins_non_none_queues_then_resets(self):
+        parent = MagicMock()
+        send = parent.send
+        recv = parent.recv
+        store = parent.store
+        store.reset.return_value = True
+        worker = self._worker(send=send, recv=recv)
+        worker.m_store = store
+        self.assertTrue(worker.reset_store())
+        self.assertEqual(
+            parent.mock_calls,
+            [
+                call.send.request_queue.join(),
+                call.recv.request_queue.join(),
+                call.store.reset(),
+            ],
+        )
+        send.join.assert_not_called()
+        recv.join.assert_not_called()
+        self.assertEqual(worker._invalid_block_ids, set())
+
+    def test_none_threads_still_remove_all(self):
+        worker = self._worker(send=None, recv=None)
+        self.assertTrue(worker.reset_store())
+        worker.m_store.reset.assert_called_once()
+        self.assertEqual(worker._invalid_block_ids, set())
+
+    def test_clears_invalid_ids_even_when_reset_fails(self):
+        worker = self._worker(reset_ok=False)
+        self.assertFalse(worker.reset_store())
+        self.assertEqual(worker._invalid_block_ids, set())
+
+    def test_clears_invalid_ids_when_join_raises(self):
+        send = MagicMock()
+        send.request_queue.join.side_effect = RuntimeError("join fail")
+        worker = self._worker(send=send)
+        self.assertFalse(worker.reset_store())
+        worker.m_store.reset.assert_not_called()
+        self.assertEqual(worker._invalid_block_ids, set())
 
 
 if __name__ == "__main__":

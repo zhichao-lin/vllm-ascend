@@ -54,3 +54,7 @@ class Backend(ABC):
     @abstractmethod
     def get(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
         pass
+
+    @abstractmethod
+    def reset(self) -> bool:
+        """Wipe backend metadata. True if the wipe succeeded or there was nothing to wipe."""

@@ -32,7 +32,11 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_b
     _parse_global_segment_size,
     _ssd_setup_kwargs,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend import (
+    MemcacheBackend,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend import (
+    YuanrongBackend,
     YuanrongConfig,
 )
 
@@ -677,6 +681,50 @@ class TestMemcacheBackendMethods(unittest.TestCase):
         error_log = _format_log_call(mock_logger.error.call_args)
         self.assertIn("RuntimeError", error_log)
         self.assertIn("backend fail", error_log)
+
+
+class TestMooncakeBackendReset(unittest.TestCase):
+    def _backend(self, store):
+        backend = MooncakeBackend.__new__(MooncakeBackend)
+        backend.store = store
+        return backend
+
+    def test_store_none_returns_true(self):
+        self.assertTrue(self._backend(None).reset())
+
+    def test_remove_all_force_true_ignores_positive_count(self):
+        store = MagicMock()
+        store.remove_all.return_value = 7
+        self.assertTrue(self._backend(store).reset())
+        store.remove_all.assert_called_once_with(force=True)
+
+    def test_typeerror_falls_back_without_force(self):
+        store = MagicMock()
+        store.remove_all.side_effect = [TypeError("no force"), -800]
+        self.assertTrue(self._backend(store).reset())
+        self.assertEqual(store.remove_all.call_args_list[0].kwargs, {"force": True})
+        self.assertEqual(store.remove_all.call_args_list[1].args, ())
+
+    def test_negative_or_none_return_is_still_true(self):
+        for ret in (-1, None, 0):
+            store = MagicMock()
+            store.remove_all.return_value = ret
+            self.assertTrue(self._backend(store).reset(), msg=repr(ret))
+
+    def test_exception_returns_false(self):
+        store = MagicMock()
+        store.remove_all.side_effect = RuntimeError("boom")
+        self.assertFalse(self._backend(store).reset())
+
+
+class TestUnsupportedBackendReset(unittest.TestCase):
+    def test_memcache_reset_returns_false(self):
+        backend = MemcacheBackend.__new__(MemcacheBackend)
+        self.assertFalse(backend.reset())
+
+    def test_yuanrong_reset_returns_false(self):
+        backend = YuanrongBackend.__new__(YuanrongBackend)
+        self.assertFalse(backend.reset())
 
 
 if __name__ == "__main__":

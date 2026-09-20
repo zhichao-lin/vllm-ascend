@@ -160,3 +160,9 @@ class YuanrongBackend(Backend):
                 exc,
             )
             logger.debug("Failed to put key details. keys=%s", failed_keys_for_log)
+
+    def reset(self) -> bool:
+        logger.error(
+            "sleep/wake reset_cache currently unsupported for backend=yuanrong"
+        )
+        return False

@@ -236,3 +236,9 @@ class MemcacheBackend(Backend):
             logger.debug("Failed to put key details. keys=%s", key)
             if self._lazy_init:
                 logger.warning("First DSV4(compress) request failure is expected. This is normal behavior.")
+
+    def reset(self) -> bool:
+        logger.error(
+            "sleep/wake reset_cache currently unsupported for backend=memcache"
+        )
+        return False

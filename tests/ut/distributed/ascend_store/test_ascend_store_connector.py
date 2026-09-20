@@ -15,9 +15,10 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import threading
 import types
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
@@ -25,7 +26,15 @@ from vllm.distributed.kv_events import KVCacheEvent
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import (
     AscendStoreConnector,
     AscendStoreKVEvents,
+    LookupKeyServer,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import (
+    LOOKUP_MSG,
+    RESET_MSG,
+    RESP_ERR,
+    RESP_OK,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
 
 # isort: on
 
@@ -391,6 +400,114 @@ class TestAscendStoreConnectorLayerwise(unittest.TestCase):
             )
             connector.wait_for_layer_load("layer_0")
             mock_worker_cls.return_value.wait_for_layer_load.assert_called_once()
+
+
+class TestLookupKeyServerReset(unittest.TestCase):
+    def _server(self, reset_ok=True):
+        server = LookupKeyServer.__new__(LookupKeyServer)
+        server.decoder = MagicMock()
+        server.pool_worker = MagicMock()
+        server.pool_worker.reset_store.return_value = reset_ok
+        server.pool_worker.lookup_scheduler.return_value = 8
+        server.decoder.decode.side_effect = [[0], ["aa"]]
+        return server
+
+    def test_reset_ok(self):
+        server = self._server(True)
+        self.assertEqual(server._handle_frames([RESET_MSG]), RESP_OK)
+
+    def test_reset_err(self):
+        server = self._server(False)
+        self.assertEqual(server._handle_frames([RESET_MSG]), RESP_ERR)
+
+    def test_reset_exception_is_err(self):
+        server = self._server()
+        server.pool_worker.reset_store.side_effect = RuntimeError("die")
+        self.assertEqual(server._handle_frames([RESET_MSG]), RESP_ERR)
+
+    def test_lookup_still_returns_u32(self):
+        server = self._server()
+        frames = [LOOKUP_MSG, (4).to_bytes(4, "big"), b"g", (0).to_bytes(4, "big"), b"h"]
+        self.assertEqual(server._handle_frames(frames), (8).to_bytes(4, "big"))
+
+    def test_unknown_msg_is_err(self):
+        server = self._server()
+        self.assertEqual(server._handle_frames([(4).to_bytes(4, "big")]), RESP_ERR)
+
+    def test_reset_path_joins_then_backend_reset(self):
+        parent = MagicMock()
+        send = parent.send
+        recv = parent.recv
+        store = parent.store
+        store.reset.return_value = True
+        worker = KVPoolWorker.__new__(KVPoolWorker)
+        worker.kv_send_thread = send
+        worker.kv_recv_thread = recv
+        worker.m_store = store
+        worker._invalid_block_ids = {1, 2}
+        worker._invalid_block_ids_lock = threading.Lock()
+        server = LookupKeyServer.__new__(LookupKeyServer)
+        server.decoder = MagicMock()
+        server.pool_worker = worker
+        self.assertEqual(server._handle_frames([RESET_MSG]), RESP_OK)
+        self.assertEqual(
+            parent.mock_calls,
+            [
+                call.send.request_queue.join(),
+                call.recv.request_queue.join(),
+                call.store.reset(),
+            ],
+        )
+        send.join.assert_not_called()
+        recv.join.assert_not_called()
+        self.assertEqual(worker._invalid_block_ids, set())
+
+
+class TestAscendStoreConnectorResetCache(unittest.TestCase):
+    def _scheduler_connector(self, *, layerwise=False):
+        c = AscendStoreConnector.__new__(AscendStoreConnector)
+        c.use_layerwise = layerwise
+        c.connector_scheduler = MagicMock()
+        c.connector_scheduler.load_specs = {"r1": object()}
+        c.connector_scheduler.reset_store.return_value = True
+        c.connector_scheduler.store_scheduler = MagicMock()
+        c._kv_cache_events = object()
+        return c
+
+    def test_scheduler_success_clears_load_specs_returns_bool(self):
+        c = self._scheduler_connector()
+        self.assertTrue(c.reset_cache())
+        self.assertEqual(c.connector_scheduler.load_specs, {})
+        self.assertIsNone(c._kv_cache_events)
+        c.connector_scheduler.reset_store.assert_called_once()
+
+    def test_scheduler_rpc_false_still_cleared_load_specs(self):
+        c = self._scheduler_connector()
+        c.connector_scheduler.reset_store.return_value = False
+        self.assertFalse(c.reset_cache())
+        self.assertEqual(c.connector_scheduler.load_specs, {})
+        self.assertIsNone(c._kv_cache_events)
+
+    def test_layerwise_returns_false_no_rpc_no_remove_all(self):
+        c = self._scheduler_connector(layerwise=True)
+        self.assertFalse(c.reset_cache())
+        c.connector_scheduler.reset_store.assert_not_called()
+        c.connector_scheduler.store_scheduler.remove_all.assert_not_called()
+        self.assertEqual(len(c.connector_scheduler.load_specs), 1)
+
+    def test_worker_missing_scheduler_attr_returns_none(self):
+        c = AscendStoreConnector.__new__(AscendStoreConnector)
+        c.use_layerwise = False
+        c.connector_worker = MagicMock()
+        self.assertFalse(hasattr(c, "connector_scheduler"))
+        self.assertIsNone(c.reset_cache())
+
+    def test_worker_scheduler_none_returns_none(self):
+        c = AscendStoreConnector.__new__(AscendStoreConnector)
+        c.use_layerwise = False
+        c.connector_scheduler = None
+        c.connector_worker = MagicMock()
+        self.assertIsNone(c.reset_cache())
 
 
 if __name__ == "__main__":

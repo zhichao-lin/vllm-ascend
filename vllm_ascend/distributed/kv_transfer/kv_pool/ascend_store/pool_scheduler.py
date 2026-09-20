@@ -992,6 +992,21 @@ class KVPoolScheduler:
         if finished_recving:
             self._loading_req_ids.difference_update(finished_recving)
 
+    def reset_store(self) -> bool:
+        try:
+            if self.client is None:
+                self.client = LookupKeyClient(self.vllm_config)
+            return self.client.reset()
+        except Exception:
+            logger.exception("KVPoolScheduler.reset_store failed")
+            return False
+
+
+LOOKUP_MSG = b"lookup"
+RESET_MSG = b"reset"
+RESP_OK = b"\x01"
+RESP_ERR = b"\x00"
+
 
 class LookupKeyClient:
     def __init__(self, vllm_config: "VllmConfig"):
@@ -1017,6 +1032,7 @@ class LookupKeyClient:
         hash_frames = self.encoder.encode(hash_strs)
         kv_group_frames = self.encoder.encode(kv_cache_group_ids)
         all_frames = [
+            LOOKUP_MSG,
             token_len.to_bytes(4, byteorder="big"),
             *kv_group_frames,
             hbm_hit_tokens.to_bytes(4, byteorder="big"),
@@ -1026,6 +1042,15 @@ class LookupKeyClient:
         resp = self.socket.recv()
         result = int.from_bytes(resp, "big")
         return result
+
+    def reset(self) -> bool:
+        try:
+            self.socket.send(RESET_MSG)
+            resp = self.socket.recv()
+            return bytes(resp) == RESP_OK
+        except Exception:
+            logger.exception("LookupKeyClient.reset failed")
+            return False
 
     def close(self):
         self.socket.close(linger=0)
