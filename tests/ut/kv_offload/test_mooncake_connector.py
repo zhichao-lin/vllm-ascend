@@ -1131,6 +1131,33 @@ class TestMetadataHandling(unittest.TestCase):
             mock_socket.close.assert_called_once()
             mock_return_socket.assert_not_called()
 
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.time.sleep")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_send")
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_recv",
+        side_effect=[RuntimeError("timed out"), b"ACK"],
+    )
+    def test_done_recv_retries_with_fresh_socket(self, mock_recv, mock_send, mock_sleep):
+        failed_socket = MagicMock(spec=zmq.Socket)  # type: ignore[attr-defined]
+        successful_socket = MagicMock(spec=zmq.Socket)  # type: ignore[attr-defined]
+        with (
+            patch.object(
+                self.thread,
+                "_get_remote_socket",
+                side_effect=[failed_socket, successful_socket],
+            ) as mock_get_socket,
+            patch.object(self.thread, "_return_remote_socket") as mock_return_socket,
+        ):
+            self.thread._send_done_recv_signal("req1", "host1", 5555, {})
+
+        self.assertEqual(mock_get_socket.call_count, 2)
+        self.assertEqual(mock_send.call_count, 2)
+        self.assertEqual(mock_recv.call_count, 2)
+        failed_socket.close.assert_called_once_with()
+        successful_socket.close.assert_not_called()
+        mock_return_socket.assert_called_once_with(successful_socket, "host1", 5555)
+        mock_sleep.assert_called_once_with(0.05)
+
 
 class TestMainThreadLoop(unittest.TestCase):
     def setUp(self):
@@ -1369,6 +1396,31 @@ class TestMooncakeConnectorSchedulerMatchedTokens(unittest.TestCase):
         self.assertEqual(tokens, 4)
         self.assertTrue(async_flag)
         self.assertEqual(request.kv_transfer_params["num_computed_tokens"], 0)
+
+    def test_remote_decode_truncates_before_prefix_cache_lookup(self):
+        self.scheduler.need_truncate = True
+        request = MockRequest(
+            "req1",
+            prompt_token_ids=[1, 2, 3, 4],
+            kv_transfer_params={"do_remote_decode": True},
+        )
+        request.prompt_embeds = None
+        request._all_token_ids = request.prompt_token_ids.copy()
+        request.num_prompt_tokens = len(request.prompt_token_ids)
+        request.max_tokens = 32
+        request.block_hashes = ["old-prompt-hash"]
+        request.update_block_hashes = MagicMock(
+            side_effect=lambda: request.block_hashes.append("short-prompt-hash")
+        )
+
+        self.scheduler.on_new_request(request)
+
+        self.assertEqual(request.prompt_token_ids, [1, 2, 3])
+        self.assertEqual(request._all_token_ids, [1, 2, 3])
+        self.assertEqual(request.num_prompt_tokens, 3)
+        self.assertEqual(request.max_tokens, 1)
+        self.assertEqual(request.block_hashes, ["short-prompt-hash"])
+        self.assertTrue(request.kv_transfer_params["_p_side_truncated"])
 
     def test_build_connector_meta(self):
         request = MockRequest("req1")
@@ -1639,6 +1691,55 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         delay_free, params = self.scheduler.request_finished(request, [1, 2, 3])
         self.assertFalse(delay_free)
         self.assertIsNone(params)
+
+    def test_request_finished_aborted_remote_prefill_enqueues_empty_recv(self):
+        request = MockRequest(
+            "req1",
+            kv_transfer_params={
+                "do_remote_prefill": True,
+                "do_remote_decode": False,
+                "remote_block_ids": ([1, 2, 3],),
+                "remote_engine_id": "remote",
+                "remote_request_id": "remote_req1",
+                "remote_host": "localhost",
+                "remote_port": 5000,
+            },
+            status=RequestStatus.FINISHED_ABORTED,
+        )
+
+        delay_free, params = self.scheduler.request_finished(request, ([],))
+
+        self.assertFalse(delay_free)
+        self.assertIsNone(params)
+        self.assertFalse(request.kv_transfer_params["do_remote_prefill"])
+        self.assertEqual(self.scheduler._reqs_need_recv["req1"], (request, ([],), ([],), 0))
+
+    def test_request_finished_aborted_after_alloc_replaces_pending_recv(self):
+        request = MockRequest(
+            "req1",
+            kv_transfer_params={
+                "do_remote_prefill": True,
+                "do_remote_decode": False,
+                "remote_block_ids": ([1, 2, 3],),
+                "remote_engine_id": "remote",
+                "remote_request_id": "remote_req1",
+                "remote_host": "localhost",
+                "remote_port": 5000,
+            },
+            status=RequestStatus.FINISHED_ABORTED,
+        )
+        self.scheduler.update_state_after_alloc(request, MockKVCacheBlocks(), 3)
+        self.assertFalse(request.kv_transfer_params["do_remote_prefill"])
+
+        delay_free, params = self.scheduler.request_finished(request, ([],))
+
+        self.assertFalse(delay_free)
+        self.assertIsNone(params)
+        self.assertEqual(self.scheduler._reqs_need_recv["req1"], (request, ([],), ([],), 0))
+
+        metadata = self.scheduler.build_connector_meta(MockSchedulerOutput())
+        self.assertEqual(metadata.requests["req1"].local_block_ids, ([],))
+        self.assertEqual(metadata.requests["req1"].num_external_tokens, 0)
 
     def test_get_transfer_block_ids_trims_attention_mtp_blocks(self):
         self.scheduler.group_transfer_info = [
@@ -3031,6 +3132,83 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         self.assertEqual(add_request_calls[1].kwargs["remote_handshake_port"], 31003)
         self.assertIsNone(add_request_calls[1].kwargs["local_block_ids_replicate_k"])
         self.assertIsNone(add_request_calls[1].kwargs["remote_block_ids_replicate_k"])
+
+    def test_start_load_kv_passes_send_counts_for_hybrid_non_cp(self):
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.kv_send_thread = None
+        worker.kv_recv_thread = MagicMock()
+        worker._prefill_tp_size = 8
+        worker._is_hma_required = True
+        send_counts = {31001: {"num": 2, "host": "localhost"}}
+        worker.remote_port_send_num = {}
+        worker._get_hybrid_remote_port_send_num = MagicMock(return_value=send_counts)
+        worker._get_sfa_replicate_k_block_ids = MagicMock(return_value=(tuple(), tuple()))
+        worker._get_kv_split_metadata = MagicMock(
+            return_value=([[31001]], [([10], [20])], [([30], [40])])
+        )
+        worker._get_group_pulls_metadata = MagicMock(
+            return_value=[[[GroupPull(group_id=0, remote_tp_offset=0, num_group_pulls=1)]]]
+        )
+        worker._get_remote_host_info_by_port = MagicMock(return_value=("localhost", "remote_engine"))
+        meta = types.SimpleNamespace(
+            remote_request_id="remote_req",
+            remote_engine_id="remote_engine",
+            remote_host="localhost",
+            remote_port=31000,
+            remote_pcp_size=1,
+            remote_dcp_size=1,
+            remote_ptp_size=8,
+            remote_multi_nodes_meta_mapping={},
+            remote_block_size=16,
+            local_block_ids=([10], [20]),
+            remote_block_ids=([30], [40]),
+            num_computed_tokens=0,
+        )
+        metadata = types.SimpleNamespace(reqs_in_batch=["req"], requests={"req": meta})
+
+        worker.start_load_kv(cast(MooncakeConnectorMetadata, metadata))
+
+        worker.kv_recv_thread.add_request.assert_called_once()
+        worker._get_hybrid_remote_port_send_num.assert_called_once_with("remote_req", meta, 8)
+        self.assertIs(
+            worker.kv_recv_thread.add_request.call_args.kwargs["remote_port_send_num"],
+            send_counts,
+        )
+
+    def test_hybrid_remote_port_send_num_counts_all_decode_senders(self):
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.tp_size = 4
+        worker._prefill_pp_size = 1
+        worker.vllm_config = self.vllm_config
+        ranks_by_decode_tp = {
+            0: [0, 1],
+            1: [2, 3, 5],
+            2: [2, 4, 5],
+            3: [6, 7],
+        }
+        worker._get_hybrid_remote_rank_group_pulls = MagicMock(
+            side_effect=lambda _req_id, _prefill_tp_size, decode_tp_rank: (
+                ranks_by_decode_tp[decode_tp_rank],
+                {},
+            )
+        )
+        worker._get_remote_host_info_by_port = MagicMock(
+            side_effect=lambda _base, port, host, engine_id, _mapping: (f"{host}-{port}", engine_id)
+        )
+        meta = types.SimpleNamespace(
+            remote_port=30000,
+            remote_host="127.0.0.1",
+            remote_engine_id="remote_engine",
+            remote_multi_nodes_meta_mapping={},
+        )
+
+        send_num = worker._get_hybrid_remote_port_send_num("test", cast(ReqMeta, meta), 8)
+
+        self.assertEqual(
+            [send_num[30000 + rank]["num"] for rank in range(8)],
+            [1, 1, 2, 1, 1, 2, 1, 1],
+        )
+        self.assertEqual(send_num[30007]["host"], "127.0.0.1-30007")
 
     def test_get_kv_split_metadata_dp1_remote_port_send_num_uses_absolute_ports(self):
         self.vllm_config.kv_transfer_config.kv_port = 30000

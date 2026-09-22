@@ -412,6 +412,25 @@
 #       Remove this patch if upstream exposes a platform allocator capability hook
 #       for sleep mode validation.
 #
+# ** 14. File: platform/patch_partial_wake_up.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.engine.core.EngineCore.wake_up`
+#    Why:
+#       Ascend CaMem can restore weights and KV cache in separate wake stages.
+#       Upstream resumes scheduling after every wake call, so a weights-only
+#       wake can dispatch partial-rollout requests while KV cache allocations
+#       are still unmapped.
+#    How:
+#       Keep the scheduler paused while the model executor still has sleeping
+#       allocation tags. Resume only after all tags are awake, or when an
+#       explicit scheduling-only wake is requested.
+#    Related PR (if no, explain why):
+#       No. This adapts upstream staged wake behavior to Ascend CaMem's tagged
+#       allocation lifecycle.
+#    Future Plan:
+#       Remove this patch once upstream EngineCore does not resume scheduling
+#       during a partial allocation-tag wake.
+#
 # ** 15. File: platform/patch_weight_transfer_engine.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.distributed.weight_transfer.factory.WeightTransferEngineFactory._registry["nccl"]`

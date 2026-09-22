@@ -1410,31 +1410,51 @@ class KVCacheRecvingThread(threading.Thread):
         logger.debug(
             "Sending done recving signal for request %s to %s:%d", request_id, remote_host, remote_handshake_port
         )
-        sock: zmq.Socket | None = None  # type: ignore
-        try:
-            sock = self._get_remote_socket(remote_host, remote_handshake_port)
-            data_bytes = self.encoder.encode((DONE_RECVING_MSG, request_id, remote_port_send_num))
-            ensure_zmq_send(sock, data_bytes, f"{remote_host}:{remote_handshake_port}")
-            resp = ensure_zmq_recv(sock, f"{remote_host}:{remote_handshake_port}")
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("Received response for request %s: %s", request_id, resp.decode("utf-8"))
-            if resp != b"ACK":
-                logger.error(
-                    "Failed to receive ACK for request. request_id=%s, source=%s:%d. ",
+        data_bytes = self.encoder.encode((DONE_RECVING_MSG, request_id, remote_port_send_num))
+        endpoint = f"{remote_host}:{remote_handshake_port}"
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            sock: zmq.Socket | None = None  # type: ignore
+            reusable = False
+            try:
+                sock = self._get_remote_socket(remote_host, remote_handshake_port)
+                ensure_zmq_send(sock, data_bytes, endpoint)
+                resp = ensure_zmq_recv(sock, endpoint)
+                if resp != b"ACK":
+                    raise RuntimeError(f"Failed to receive ACK, resp: {resp.decode('utf-8')}")
+                reusable = True
+                logger.debug("Received DONE_RECVING ACK for request %s", request_id)
+                return
+            except RuntimeError as e:
+                logger.warning(
+                    "Failed to deliver DONE_RECVING_MSG for request %s to %s "
+                    "(attempt %d/%d): %s",
                     request_id,
-                    remote_host,
-                    remote_handshake_port,
+                    endpoint,
+                    attempt,
+                    max_attempts,
+                    e,
                 )
-                raise RuntimeError(f"Failed to receive ACK, resp: {resp.decode('utf-8')}")
-        except RuntimeError as e:
-            if isinstance(sock, zmq.Socket):  # type: ignore
-                sock.close()
-                sock = None
-                logger.warning("Unexpected error occurred in socket. error=%s. ", e)
-        finally:
-            if sock is not None:
-                self._return_remote_socket(sock, remote_host, remote_handshake_port)
-                logger.debug("Returned socket to pool for %s:%d", remote_host, remote_handshake_port)
+            finally:
+                if sock is not None:
+                    if reusable:
+                        self._return_remote_socket(sock, remote_host, remote_handshake_port)
+                    else:
+                        # A REQ socket cannot be reused after a timeout or malformed
+                        # reply because its send/receive state is no longer known.
+                        sock.close()
+
+            if attempt < max_attempts:
+                time.sleep(0.05 * attempt)
+
+        logger.error(
+            "Failed to deliver DONE_RECVING_MSG after %d attempts. "
+            "request_id=%s, destination=%s. Prefill KV will remain protected "
+            "until its abort timeout.",
+            max_attempts,
+            request_id,
+            endpoint,
+        )
 
     def _get_remote_socket(self, remote_host: str, remote_handshake_port: int) -> zmq.Socket:  # type: ignore
         """Get a socket to the remote host."""
@@ -1523,6 +1543,10 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     ############################################################
     # Scheduler Side Methods
     ############################################################
+
+    def on_new_request(self, request: "Request") -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.on_new_request(request)
 
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
         assert self.connector_scheduler is not None
@@ -1781,7 +1805,18 @@ class MooncakeConnectorScheduler:
             request._all_token_ids.pop()
             request.num_prompt_tokens -= 1
             request.max_tokens = 1
+            # on_new_request runs after Request initially builds its hashes.
+            # Rebuild them for the shortened P-side prompt so prefix-cache
+            # lookup cannot return more computed tokens than the request now
+            # contains on a later rollout.
+            request.block_hashes.clear()
+            request.update_block_hashes()
             params["_p_side_truncated"] = True
+
+    def on_new_request(self, request: "Request") -> None:
+        params = request.kv_transfer_params
+        if params is not None and params.get("do_remote_decode") and self.need_truncate:
+            self._truncate_request_for_prefill(request)
 
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
         """
@@ -1814,9 +1849,6 @@ class MooncakeConnectorScheduler:
             count = max(actual - num_computed_tokens, 0)
             if count > 0:
                 return count, True
-
-        if params is not None and params.get("do_remote_decode") and self.need_truncate:
-            self._truncate_request_for_prefill(request)
 
         # No remote prefill for this request.
         return 0, False
@@ -1894,11 +1926,26 @@ class MooncakeConnectorScheduler:
             "MooncakeConnector request_finished, request_status=%s, kv_transfer_params=%s", request.status, params
         )
 
-        if (
-            params is None
-            or not params.get("do_remote_decode")
-            or request.status != RequestStatus.FINISHED_LENGTH_CAPPED
-        ):
+        if params is None:
+            return False, None
+
+        # A decode-side request may be aborted by partial rollout before its
+        # pending remote KV receive is handed to the worker. Preserve an empty
+        # receive entry so the worker still sends DONE_RECVING_MSG to the
+        # prefill node. Otherwise the prefiller retains the request's blocks
+        # until VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT expires.
+        if params.get("do_remote_prefill") or request.request_id in self._reqs_need_recv:
+            empty_block_ids: BlockIds = tuple([] for _ in self.kv_cache_groups)
+            self._reqs_need_recv[request.request_id] = (
+                request,
+                empty_block_ids,
+                empty_block_ids,
+                0,
+            )
+            params["do_remote_prefill"] = False
+            return False, None
+
+        if not params.get("do_remote_decode") or request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
             return False, None
 
         num_prompt_blocks = math.ceil(len(request.prompt_token_ids) / self.block_size)
@@ -3200,7 +3247,11 @@ class MooncakeConnectorWorker:
         self,
         req_id: str,
         prefill_tp_size: int,
+        decode_tp_rank: int | None = None,
     ) -> tuple[list[int], dict[int, list[GroupPull]]]:
+        if decode_tp_rank is None:
+            decode_tp_rank = self.tp_rank
+
         rank_group_pulls: OrderedDict[int, list[GroupPull]] = OrderedDict()
 
         def add_group_pull(remote_rank: int, group_pull: GroupPull) -> None:
@@ -3218,7 +3269,7 @@ class MooncakeConnectorWorker:
                 num_group_pulls = prefill_tp_size // self.tp_size
                 for pp_rank in range(self._prefill_pp_size):
                     pp_rank_offset = pp_rank * prefill_tp_size
-                    local_tp_offset = self.tp_rank * num_group_pulls
+                    local_tp_offset = decode_tp_rank * num_group_pulls
                     for remote_tp_offset in range(num_group_pulls):
                         remote_rank = pp_rank_offset + local_tp_offset + remote_tp_offset
                         add_group_pull(
@@ -3234,7 +3285,12 @@ class MooncakeConnectorWorker:
                 continue
 
             num_group_pulls = self._get_attention_group_num_need_pulls(group_spec, prefill_tp_size)
-            chosen_rank_list = self._get_attention_group_remote_rank(req_id, group_spec, prefill_tp_size)
+            chosen_rank_list = self._get_attention_group_remote_rank(
+                req_id,
+                group_spec,
+                prefill_tp_size,
+                decode_tp_rank,
+            )
             assert len(chosen_rank_list) == num_group_pulls * self._prefill_pp_size, (
                 f"chosen_rank_list({chosen_rank_list}) does not match num_group_pulls({num_group_pulls}) "
                 f"and prefill pp size({self._prefill_pp_size})."
@@ -3253,6 +3309,36 @@ class MooncakeConnectorWorker:
                 )
 
         return list(rank_group_pulls), dict(rank_group_pulls)
+
+    def _get_hybrid_remote_port_send_num(
+        self,
+        req_id: str,
+        meta: ReqMeta,
+        prefill_tp_size: int,
+    ) -> dict[int, RemotePortInfo]:
+        remote_port_send_num: dict[int, RemotePortInfo] = {}
+        num_prefill_workers = prefill_tp_size * self._prefill_pp_size
+        for remote_rank in range(num_prefill_workers):
+            remote_port = meta.remote_port + remote_rank
+            remote_host, _ = self._get_remote_host_info_by_port(
+                meta.remote_port,
+                remote_port,
+                meta.remote_host,
+                meta.remote_engine_id,
+                meta.remote_multi_nodes_meta_mapping,
+            )
+            remote_port_send_num[remote_port] = {"num": 0, "host": remote_host}
+
+        for decode_tp_rank in range(self.tp_size):
+            remote_ranks, _ = self._get_hybrid_remote_rank_group_pulls(
+                req_id,
+                prefill_tp_size,
+                decode_tp_rank,
+            )
+            for remote_rank in remote_ranks:
+                remote_port_send_num[meta.remote_port + remote_rank]["num"] += 1
+
+        return remote_port_send_num
 
     def _get_attention_group_num_need_pulls(self, group_spec: dict[str, Any], prefill_tp_size: int) -> int:
         return self._get_attention_group_num_need_pulls_for_decode_tp(group_spec, prefill_tp_size, self.tp_size)
@@ -3289,7 +3375,10 @@ class MooncakeConnectorWorker:
         req_id: str,
         group_spec: dict[str, Any],
         prefill_tp_size: int,
+        decode_tp_rank: int | None = None,
     ) -> list[int]:
+        if decode_tp_rank is None:
+            decode_tp_rank = self.tp_rank
         num_key_value_heads = self._get_attention_group_num_key_value_heads(group_spec)
         num_group_pulls = self._get_attention_group_num_need_pulls(group_spec, prefill_tp_size)
         return self._get_remote_ranks_for_req(
@@ -3298,7 +3387,7 @@ class MooncakeConnectorWorker:
             num_key_value_heads=num_key_value_heads,
             tp_num_need_pulls=num_group_pulls,
             use_mla=num_key_value_heads == 1,
-        )[self.tp_rank]
+        )[decode_tp_rank]
 
     def _get_sfa_replicate_k_block_ids(
         self,
@@ -3418,6 +3507,17 @@ class MooncakeConnectorWorker:
                 meta.remote_dcp_size,
             )
 
+            if meta.remote_pcp_size * meta.remote_dcp_size > 1:
+                remote_port_send_num = self.remote_port_send_num[meta.remote_engine_id]
+            elif self._is_hma_required:
+                remote_port_send_num = self._get_hybrid_remote_port_send_num(
+                    remote_req_id,
+                    meta,
+                    prefill_tp_size,
+                )
+            else:
+                remote_port_send_num = None
+
             for pcp_dcp_rank, remote_ports in enumerate(remote_handshake_port_list):
                 for remote_tp_offset, remote_handshake_port in enumerate(remote_ports):
                     assert self.kv_recv_thread is not None
@@ -3427,11 +3527,6 @@ class MooncakeConnectorWorker:
                         meta.remote_host,
                         meta.remote_engine_id,
                         meta.remote_multi_nodes_meta_mapping,
-                    )
-                    remote_port_send_num = (
-                        self.remote_port_send_num[meta.remote_engine_id]
-                        if meta.remote_pcp_size * meta.remote_dcp_size > 1
-                        else None
                     )
                     local_block_ids_replicate_k_for_port = (
                         local_block_ids_replicate_k

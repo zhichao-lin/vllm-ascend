@@ -60,6 +60,7 @@ from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
+from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
@@ -225,6 +226,7 @@ class NPUWorker(WorkerBase):
             self.sleep_wakeup_manager.sleep()
 
         allocator = CaMemAllocator.get_instance()
+        global_te.unregister_buffer()
         allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
         free_bytes_after_sleep, total = torch.npu.mem_get_info()
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
@@ -238,6 +240,9 @@ class NPUWorker(WorkerBase):
             used_bytes / GiB_bytes,
         )
 
+    def disconnect_kv_transfer_peers(self) -> None:
+        global_te.disconnect_all_peers()
+
     def wake_up(self, tags: list[str] | None = None) -> None:
         nz_mode = get_ascend_config().weight_nz_mode
         if nz_mode:
@@ -247,6 +252,8 @@ class NPUWorker(WorkerBase):
             )
         allocator = CaMemAllocator.get_instance()
         allocator.wake_up(tags=tags)
+        if tags is None or "kv_cache" in tags:
+            global_te.reregister_buffer()
 
         hidden_size = self.vllm_config.model_config.hf_text_config.hidden_size
         model = self.model_runner.model
