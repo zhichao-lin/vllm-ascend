@@ -193,6 +193,12 @@ class MooncakeBackend(Backend):
         assert self.store is not None
         return self.store.batch_is_exist(keys)
 
+    def remove_all(self) -> None:
+        """Delete every object on the Mooncake master. The client stays open."""
+        if not self._store_initialized or self.store is None:
+            return
+        self.store.remove_all(force=True)
+
     def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
         self.ensure_initialized()
         assert self.store is not None

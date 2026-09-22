@@ -366,6 +366,17 @@ class TestMooncakeBackendMethods(unittest.TestCase):
         result = b.exists(["k1", "k2"])
         self.assertEqual(result, [1, 0])
 
+    def test_remove_all_force(self):
+        b = self._make_backend()
+        b.remove_all()
+        b.store.remove_all.assert_called_once_with(force=True)
+
+    def test_remove_all_skips_uninitialized_store(self):
+        b = self._make_backend()
+        b.store = None
+        b._store_initialized = False
+        b.remove_all()
+
     def test_put(self):
         b = self._make_backend()
         b.store.batch_put_from_multi_buffers.return_value = [0, 0]
