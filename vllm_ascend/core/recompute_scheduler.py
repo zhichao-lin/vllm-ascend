@@ -50,6 +50,8 @@ from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.utils import ConstantList, record_function_or_nullcontext
 
+from vllm_ascend.core.paused_remote_prefill import mark_late_remote_prefill_abort
+
 
 @dataclass
 class RecomputeSchedulerConfig(SchedulerConfig):
@@ -134,6 +136,9 @@ class RecomputeScheduler(Scheduler):
                 self.connector.on_new_request(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+            # This override does not call Scheduler.add_request, so the
+            # global wrap does not run here. Mark only this new insert.
+            mark_late_remote_prefill_abort(self, request)
 
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
         """

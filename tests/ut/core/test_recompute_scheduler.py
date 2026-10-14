@@ -5,6 +5,7 @@ from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
 
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.request import Request
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 
@@ -21,6 +22,7 @@ def test_pd_consumer_first_step_injects_placeholder_spec_tokens():
     scheduler.max_model_len = 1024
     scheduler.log_stats = False
     scheduler.connector = None
+    scheduler._pause_state = PauseState.UNPAUSED
 
     enqueued_requests = []
 

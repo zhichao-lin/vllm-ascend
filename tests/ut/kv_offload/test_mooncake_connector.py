@@ -1714,6 +1714,12 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         self.assertFalse(request.kv_transfer_params["do_remote_prefill"])
         self.assertEqual(self.scheduler._reqs_need_recv["req1"], (request, ([],), ([],), 0))
 
+        metadata = self.scheduler.build_connector_meta(MockSchedulerOutput())
+        self.assertEqual(metadata.requests["req1"].local_block_ids, ([],))
+        self.assertEqual(metadata.requests["req1"].num_external_tokens, 0)
+        self.assertEqual(metadata.requests["req1"].remote_request_id, "remote_req1")
+        self.assertEqual(self.scheduler._reqs_need_recv, {})
+
     def test_request_finished_aborted_after_alloc_replaces_pending_recv(self):
         request = MockRequest(
             "req1",

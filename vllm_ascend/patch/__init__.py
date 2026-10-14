@@ -1119,3 +1119,24 @@
 #       runner and can rely on upstream's default enablement heuristics
 #       (model architecture, Triton, feature checks) without crashes or
 #       degraded functionality.
+#
+# ** 31. File: platform/patch_paused_remote_prefill.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `Scheduler.add_request`
+#    Why:
+#       A decode request that still has do_remote_prefill can arrive after
+#       PAUSED_NEW has finished draining. It sits in waiting and never
+#       reaches the receive thread, so the prefiller holds blocks until
+#       VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT.
+#    How:
+#       Wrap the original Scheduler.add_request. For a newly inserted,
+#       unfinished request, set abort_immediately when the scheduler is
+#       PAUSED_NEW and do_remote_prefill is still true. EngineCore aborts
+#       the request after add_request returns and the existing Mooncake
+#       empty-recv path sends DONE. RecomputeScheduler.add_request calls
+#       the same helper because it does not use the wrapped method.
+#    Related PR (if no, explain why):
+#       Local PD fix. No upstream PR yet.
+#    Future Plan:
+#       Drop the wrap if upstream scheduler admission learns about a
+#       paused remote-prefill request and aborts it on the same path.
